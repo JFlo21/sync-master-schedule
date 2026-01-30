@@ -106,6 +106,10 @@ class AttachmentSyncer:
             if match_value is not None:
                 match_key = self._extract_match_key(match_value)
                 if match_key is not None:
+                    # Warn if duplicate keys exist
+                    if match_key in row_map:
+                        logger.warning(f"⚠️ Duplicate match key {match_key} found. "
+                                     f"Row {row.id} will overwrite row {row_map[match_key].id}")
                     row_map[match_key] = row
                     logger.debug(f"Mapped key {match_key} to row {row.id}")
 
@@ -129,8 +133,8 @@ class AttachmentSyncer:
         
         logger.debug(f"📥 Downloading attachment: {safe_name}")
         
-        # Use context manager for proper resource cleanup
-        with requests.get(url, stream=True) as response:
+        # Use context manager for proper resource cleanup with timeout
+        with requests.get(url, stream=True, timeout=(10, 60)) as response:
             response.raise_for_status()
             with open(file_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
@@ -214,6 +218,7 @@ class AttachmentSyncer:
 
             # Process each attachment
             for attachment in file_attachments:
+                file_path = None  # Initialize to track cleanup
                 try:
                     # Skip if already exists
                     if skip_existing and attachment.name in existing_names:
@@ -240,24 +245,17 @@ class AttachmentSyncer:
                     copied_count += 1
                     self.stats["attachments_synced"] += 1
 
-                    # Clean up downloaded file
-                    try:
-                        os.remove(file_path)
-                        logger.debug(f"🗑️ Cleaned up temp file: {file_path}")
-                    except Exception as e:
-                        logger.warning(f"Could not delete temp file {file_path}: {e}")
-
                 except Exception as e:
                     logger.error(f"❌ Error copying attachment {attachment.name}: {e}")
                     self.stats["errors"] += 1
-                    # Clean up downloaded file even on error
-                    try:
-                        if 'file_path' in locals() and os.path.exists(file_path):
+                finally:
+                    # Clean up downloaded file
+                    if file_path and os.path.exists(file_path):
+                        try:
                             os.remove(file_path)
-                            logger.debug(f"🗑️ Cleaned up temp file after error: {file_path}")
-                    except Exception as cleanup_error:
-                        logger.warning(f"Could not delete temp file {file_path}: {cleanup_error}")
-                    continue
+                            logger.debug(f"🗑️ Cleaned up temp file: {file_path}")
+                        except Exception as e:
+                            logger.warning(f"Could not delete temp file {file_path}: {e}")
 
         except Exception as e:
             logger.error(f"❌ Error processing attachments for row {source_row_id}: {e}")

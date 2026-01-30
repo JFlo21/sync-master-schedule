@@ -26,4 +26,7 @@ jobs:
         run: python main.py
       - name: Cleanup
         if: always()
-        run: rm -rf /tmp/smartsheet-attachments/*
+        run: |
+          if [ -d /tmp/smartsheet-attachments ]; then
+            rm -rf /tmp/smartsheet-attachments/*
+          fi

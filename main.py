@@ -37,13 +37,15 @@ def validate_config():
     """
     errors = []
 
-    if not SMARTSHEET_API_KEY:
+    if not SMARTSHEET_API_KEY or not SMARTSHEET_API_KEY.strip():
         errors.append("❌ SMARTSHEET_API_KEY is required but not set")
+    elif len(SMARTSHEET_API_KEY.strip()) < 20:
+        errors.append("❌ SMARTSHEET_API_KEY appears to be invalid (too short)")
 
-    if not SOURCE_SHEET_ID:
+    if not SOURCE_SHEET_ID or not SOURCE_SHEET_ID.strip():
         errors.append("❌ SOURCE_SHEET_ID is required but not set")
 
-    if not TARGET_SHEET_ID:
+    if not TARGET_SHEET_ID or not TARGET_SHEET_ID.strip():
         errors.append("❌ TARGET_SHEET_ID is required but not set")
 
     if errors:

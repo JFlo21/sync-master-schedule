@@ -12,6 +12,10 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     
+    # Explicitly set minimal permissions for the GITHUB_TOKEN
+    permissions:
+      contents: read
+    
     # Configure the matching column name as an environment variable
     env:
       MATCH_COLUMN_NAME: 'Project ID'  # Change this to match your column name

@@ -12,6 +12,10 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     
+    # Configure the matching column name as an environment variable
+    env:
+      MATCH_COLUMN_NAME: 'Project ID'  # Change this to match your column name
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,6 +35,6 @@ jobs:
           SMARTSHEET_ACCESS_TOKEN: ${{ secrets.SMARTSHEET_ACCESS_TOKEN }}
           SOURCE_SHEET_ID: ${{ secrets.SOURCE_SHEET_ID }}
           TARGET_SHEET_ID: ${{ secrets.TARGET_SHEET_ID }}
-          MATCH_COLUMN_NAME: ${{ secrets.MATCH_COLUMN_NAME }}
+          # MATCH_COLUMN_NAME is inherited from job-level env
         run: |
           python sync_attachments.py

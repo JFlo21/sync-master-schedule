@@ -3,7 +3,7 @@
 Smartsheet Attachment Sync Script
 
 This script syncs FILE-type attachments between Smartsheet sheets by matching rows
-based on column ID criteria. It skips duplicate attachments that already exist.
+based on column name criteria. It skips duplicate attachments that already exist.
 
 Environment Variables Required:
     SMARTSHEET_ACCESS_TOKEN: API access token for Smartsheet
@@ -16,6 +16,7 @@ import os
 import sys
 import logging
 from typing import Dict, List, Optional, Set
+from dotenv import load_dotenv
 import smartsheet
 
 # Configure logging
@@ -87,13 +88,27 @@ class SmartsheetAttachmentSync:
             
         Returns:
             Dictionary mapping column values to row IDs
+        
+        Note:
+            If duplicate values exist in the column, only the last row is kept.
+            A warning is logged when duplicates are detected.
         """
         row_map = {}
+        duplicates = []
+        
         for row in sheet.rows:
             for cell in row.cells:
                 if cell.column_id == column_id and cell.value:
-                    row_map[str(cell.value)] = row.id
+                    value = str(cell.value)
+                    if value in row_map:
+                        duplicates.append(value)
+                    row_map[value] = row.id
                     break
+        
+        if duplicates:
+            logger.warning(f"Duplicate values found in matching column: {set(duplicates)}")
+            logger.warning("Only the last occurrence of each duplicate value will be processed")
+        
         return row_map
     
     def get_row_attachments(self, sheet_id: str, row_id: int) -> List:
@@ -241,7 +256,9 @@ class SmartsheetAttachmentSync:
 
 def main():
     """Main entry point for the script."""
-    # Load environment variables
+    # Load environment variables from .env file if present
+    load_dotenv()
+    
     access_token = os.environ.get('SMARTSHEET_ACCESS_TOKEN')
     source_sheet_id = os.environ.get('SOURCE_SHEET_ID')
     target_sheet_id = os.environ.get('TARGET_SHEET_ID')

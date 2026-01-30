@@ -1,6 +1,6 @@
 # Sync Master Schedule - Smartsheet Attachment Sync
 
-A Python application that automatically syncs FILE-type attachments between Smartsheet sheets. The app matches rows based on column ID criteria and copies attachments from source to target rows, intelligently skipping duplicates.
+A Python application that automatically syncs FILE-type attachments between Smartsheet sheets. The app matches rows based on column name and copies attachments from source to target rows, intelligently skipping duplicates.
 
 ## Features
 
@@ -59,16 +59,16 @@ Sheet IDs can be found in the URL when viewing a sheet:
 https://app.smartsheet.com/sheets/[SHEET_ID]
 ```
 
-### 4. Configure GitHub Secrets
+### 4. Configure GitHub Secrets and Variables
 
 For the GitHub Actions workflow to run automatically:
 
 1. Go to your repository Settings → Secrets and variables → Actions
-2. Add the following repository secrets:
+2. Add the following **repository secrets**:
    - `SMARTSHEET_ACCESS_TOKEN`
    - `SOURCE_SHEET_ID`
    - `TARGET_SHEET_ID`
-   - `MATCH_COLUMN_NAME`
+3. Edit the workflow file `.github/workflows/sync-attachments.yml` to set the `MATCH_COLUMN_NAME` in the `env:` section (line 15) to match your column name.
 
 ## Usage
 

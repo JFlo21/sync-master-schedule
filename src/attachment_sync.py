@@ -123,15 +123,18 @@ class AttachmentSyncer:
         Returns:
             Path to downloaded file
         """
-        file_path = os.path.join(self.temp_folder, name)
+        # Sanitize filename to prevent path traversal
+        safe_name = os.path.basename(name)
+        file_path = os.path.join(self.temp_folder, safe_name)
         
-        logger.debug(f"📥 Downloading attachment: {name}")
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-
-        with open(file_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+        logger.debug(f"📥 Downloading attachment: {safe_name}")
+        
+        # Use context manager for proper resource cleanup
+        with requests.get(url, stream=True) as response:
+            response.raise_for_status()
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
 
         logger.debug(f"✅ Downloaded to: {file_path}")
         return file_path
@@ -226,11 +229,12 @@ class AttachmentSyncer:
 
                     # Upload to target row
                     logger.info(f"📤 Uploading {attachment.name} to target row {target_row_id}")
-                    self.client.Attachments.attach_file_to_row(
-                        target_sheet_id,
-                        target_row_id,
-                        (attachment.name, open(file_path, 'rb'), attachment.mime_type)
-                    )
+                    with open(file_path, 'rb') as f:
+                        self.client.Attachments.attach_file_to_row(
+                            target_sheet_id,
+                            target_row_id,
+                            (attachment.name, f, attachment.mime_type)
+                        )
 
                     logger.info(f"✅ Successfully copied: {attachment.name}")
                     copied_count += 1
@@ -246,6 +250,13 @@ class AttachmentSyncer:
                 except Exception as e:
                     logger.error(f"❌ Error copying attachment {attachment.name}: {e}")
                     self.stats["errors"] += 1
+                    # Clean up downloaded file even on error
+                    try:
+                        if 'file_path' in locals() and os.path.exists(file_path):
+                            os.remove(file_path)
+                            logger.debug(f"🗑️ Cleaned up temp file after error: {file_path}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Could not delete temp file {file_path}: {cleanup_error}")
                     continue
 
         except Exception as e:

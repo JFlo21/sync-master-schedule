@@ -51,7 +51,8 @@ def validate_config():
         for error in errors:
             logger.error(error)
         logger.error("\nPlease set the required environment variables.")
-        logger.error("See .env.example for reference.")
+        logger.error("For local development: see .env.example")
+        logger.error("For GitHub Actions: set repository secrets in Settings → Secrets and variables → Actions")
         return False
 
     # Log configuration (without sensitive data)

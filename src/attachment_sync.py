@@ -289,6 +289,12 @@ class AttachmentSyncer:
                         self.stats["attachments_skipped"] += 1
                         continue
 
+                    # Validate attachment URL
+                    if not attachment.url or not str(attachment.url).strip():
+                        logger.warning(f"⚠️ Skipping attachment '{attachment.name}' due to missing or invalid URL")
+                        self.stats["attachments_skipped"] += 1
+                        continue
+
                     # Download attachment
                     file_path = self._download_attachment(
                         attachment.name, 

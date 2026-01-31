@@ -144,6 +144,43 @@ class AttachmentSyncer:
         logger.debug(f"✅ Downloaded to: {file_path}")
         return file_path
 
+    def _build_attachment_cache(self, sheet_id: str, row_ids: list) -> Dict[int, list]:
+        """
+        Build a cache of attachments for multiple rows to reduce API calls.
+
+        Args:
+            sheet_id: Sheet ID
+            row_ids: List of row IDs to fetch attachments for
+
+        Returns:
+            Dictionary mapping row_id to list of attachment objects
+        """
+        attachment_cache = {}
+        
+        logger.info(f"📦 Pre-fetching attachments for {len(row_ids)} rows...")
+        
+        for row_id in row_ids:
+            try:
+                attachments = self.client.Attachments.list_row_attachments(
+                    sheet_id, row_id, include_all=True
+                ).data
+                
+                # Only cache FILE type attachments
+                file_attachments = [
+                    att for att in attachments 
+                    if att.attachment_type == "FILE"
+                ]
+                
+                attachment_cache[row_id] = file_attachments
+                logger.debug(f"Cached {len(file_attachments)} FILE attachments for row {row_id}")
+                
+            except Exception as e:
+                logger.warning(f"Could not get attachments for row {row_id}: {e}")
+                attachment_cache[row_id] = []
+        
+        logger.info(f"✅ Attachment cache built for {len(attachment_cache)} rows")
+        return attachment_cache
+
     def _get_existing_attachment_names(self, sheet_id: str, row_id: int) -> Set[str]:
         """
         Get set of FILE attachment names on a row.
@@ -171,13 +208,29 @@ class AttachmentSyncer:
             logger.warning(f"Could not get attachments for row {row_id}: {e}")
             return set()
 
+    def _get_attachment_names_from_cache(self, attachment_cache: Dict[int, list], row_id: int) -> Set[str]:
+        """
+        Get attachment names from cache.
+
+        Args:
+            attachment_cache: Cache of attachments
+            row_id: Row ID
+
+        Returns:
+            Set of attachment filenames
+        """
+        attachments = attachment_cache.get(row_id, [])
+        return {att.name for att in attachments}
+
     def copy_attachments_to_row(
         self,
         source_sheet_id: str,
         source_row_id: int,
         target_sheet_id: str,
         target_row_id: int,
-        skip_existing: bool = True
+        skip_existing: bool = True,
+        source_attachment_cache: Optional[Dict[int, list]] = None,
+        target_attachment_cache: Optional[Dict[int, list]] = None
     ) -> int:
         """
         Copy attachments between rows.
@@ -188,6 +241,8 @@ class AttachmentSyncer:
             target_sheet_id: Target sheet ID
             target_row_id: Target row ID
             skip_existing: If True, skip attachments that already exist on target
+            source_attachment_cache: Optional cache of source attachments
+            target_attachment_cache: Optional cache of target attachments
 
         Returns:
             Number of attachments copied
@@ -195,26 +250,35 @@ class AttachmentSyncer:
         copied_count = 0
 
         try:
-            # Get source attachments
-            source_attachments = self.client.Attachments.list_row_attachments(
-                source_sheet_id, source_row_id, include_all=True
-            ).data
+            # Get source attachments from cache or fetch directly
+            if source_attachment_cache is not None:
+                file_attachments = source_attachment_cache.get(source_row_id, [])
+            else:
+                source_attachments = self.client.Attachments.list_row_attachments(
+                    source_sheet_id, source_row_id, include_all=True
+                ).data
 
-            # Filter to FILE type only
-            file_attachments = [
-                att for att in source_attachments 
-                if att.attachment_type == "FILE"
-            ]
+                # Filter to FILE type only
+                file_attachments = [
+                    att for att in source_attachments 
+                    if att.attachment_type == "FILE"
+                ]
 
             if not file_attachments:
                 logger.debug(f"⏭️ No FILE attachments on source row {source_row_id}")
                 return 0
 
             # Get existing attachment names on target if skip_existing is True
+            existing_names = set()
             if skip_existing:
-                existing_names = self._get_existing_attachment_names(
-                    target_sheet_id, target_row_id
-                )
+                if target_attachment_cache is not None:
+                    existing_names = self._get_attachment_names_from_cache(
+                        target_attachment_cache, target_row_id
+                    )
+                else:
+                    existing_names = self._get_existing_attachment_names(
+                        target_sheet_id, target_row_id
+                    )
 
             # Process each attachment
             for attachment in file_attachments:
@@ -300,6 +364,23 @@ class AttachmentSyncer:
             logger.info(f"📊 Source rows with match values: {len(source_map)}")
             logger.info(f"📊 Target rows with match values: {len(target_map)}")
 
+            # Identify matched row IDs to pre-fetch attachments
+            matched_source_row_ids = []
+            matched_target_row_ids = []
+            
+            for match_key, source_row in source_map.items():
+                if match_key in target_map:
+                    matched_source_row_ids.append(source_row.id)
+                    matched_target_row_ids.append(target_map[match_key].id)
+            
+            # Pre-fetch attachments for all matched rows to reduce N+1 API calls
+            source_attachment_cache = self._build_attachment_cache(
+                self.source_sheet_id, matched_source_row_ids
+            )
+            target_attachment_cache = self._build_attachment_cache(
+                self.target_sheet_id, matched_target_row_ids
+            )
+
             # Sync from source to target
             logger.info("🔄 Starting attachment sync...")
             for match_key, source_row in source_map.items():
@@ -316,13 +397,15 @@ class AttachmentSyncer:
                 logger.info(f"🔗 Processing match key {match_key}: "
                           f"source row {source_row.id} → target row {target_row.id}")
 
-                # Copy new attachments from source to target
+                # Copy new attachments from source to target using cached data
                 copied = self.copy_attachments_to_row(
                     source_sheet_id=self.source_sheet_id,
                     source_row_id=source_row.id,
                     target_sheet_id=self.target_sheet_id,
                     target_row_id=target_row.id,
-                    skip_existing=True  # Prevents duplicates
+                    skip_existing=True,  # Prevents duplicates
+                    source_attachment_cache=source_attachment_cache,
+                    target_attachment_cache=target_attachment_cache
                 )
 
                 if copied > 0:

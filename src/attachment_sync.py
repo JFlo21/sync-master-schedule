@@ -210,7 +210,6 @@ class AttachmentSyncer:
                 return 0
 
             # Get existing attachment names on target if skip_existing is True
-            existing_names = set()
             if skip_existing:
                 existing_names = self._get_existing_attachment_names(
                     target_sheet_id, target_row_id

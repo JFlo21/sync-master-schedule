@@ -269,7 +269,6 @@ class AttachmentSyncer:
                 return 0
 
             # Get existing attachment names on target if skip_existing is True
-            existing_names = set()
             if skip_existing:
                 if target_attachment_cache is not None:
                     existing_names = self._get_attachment_names_from_cache(

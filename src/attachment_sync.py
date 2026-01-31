@@ -5,7 +5,7 @@ import logging
 import os
 import smartsheet
 import requests
-from typing import Dict, Set, Optional
+from typing import Dict, Set, Optional, List, Any
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +144,7 @@ class AttachmentSyncer:
         logger.debug(f"✅ Downloaded to: {file_path}")
         return file_path
 
-    def _build_attachment_cache(self, sheet_id: str, row_ids: list) -> Dict[int, list]:
+    def _build_attachment_cache(self, sheet_id: str, row_ids: List[int]) -> Dict[int, List[Any]]:
         """
         Build a cache of attachments for multiple rows to reduce API calls.
 
@@ -208,13 +208,13 @@ class AttachmentSyncer:
             logger.warning(f"Could not get attachments for row {row_id}: {e}")
             return set()
 
-    def _get_attachment_names_from_cache(self, attachment_cache: Dict[int, list], row_id: int) -> Set[str]:
+    def _get_attachment_names_from_cache(self, attachment_cache: Dict[int, List[Any]], row_id: int) -> Set[str]:
         """
-        Get attachment names from cache.
+        Extract attachment filenames from the pre-built cache for a specific row.
 
         Args:
-            attachment_cache: Cache of attachments
-            row_id: Row ID
+            attachment_cache: Cache of attachments mapping row_id to attachment list
+            row_id: Row ID to get attachment names for
 
         Returns:
             Set of attachment filenames
@@ -229,8 +229,8 @@ class AttachmentSyncer:
         target_sheet_id: str,
         target_row_id: int,
         skip_existing: bool = True,
-        source_attachment_cache: Optional[Dict[int, list]] = None,
-        target_attachment_cache: Optional[Dict[int, list]] = None
+        source_attachment_cache: Optional[Dict[int, List[Any]]] = None,
+        target_attachment_cache: Optional[Dict[int, List[Any]]] = None
     ) -> int:
         """
         Copy attachments between rows.
@@ -241,8 +241,8 @@ class AttachmentSyncer:
             target_sheet_id: Target sheet ID
             target_row_id: Target row ID
             skip_existing: If True, skip attachments that already exist on target
-            source_attachment_cache: Optional cache of source attachments
-            target_attachment_cache: Optional cache of target attachments
+            source_attachment_cache: Optional cache of source attachments mapping row_id to attachment list
+            target_attachment_cache: Optional cache of target attachments mapping row_id to attachment list
 
         Returns:
             Number of attachments copied

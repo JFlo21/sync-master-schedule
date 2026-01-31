@@ -181,7 +181,7 @@ class AttachmentSyncer:
                         ).data
                         attachments_with_urls.append(full_attachment)
                     except Exception as e:
-                        logger.warning(f"Could not get details for attachment {att.id} on row {row_id}: {e}")
+                        logger.warning(f"Could not get details for attachment {att.id} on row {row_id}, will not be cached: {e}")
                 
                 attachment_cache[row_id] = attachments_with_urls
                 logger.debug(f"Cached {len(attachments_with_urls)} FILE attachments with URLs for row {row_id}")
@@ -281,7 +281,7 @@ class AttachmentSyncer:
                             ).data
                             file_attachments.append(full_attachment)
                         except Exception as e:
-                            logger.warning(f"Could not get details for attachment {att.id}: {e}")
+                            logger.warning(f"Could not get details for attachment {att.id}, will not be copied: {e}")
 
             if not file_attachments:
                 logger.debug(f"⏭️ No FILE attachments on source row {source_row_id}")

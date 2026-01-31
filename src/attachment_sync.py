@@ -275,17 +275,15 @@ class AttachmentSyncer:
         logger.info("=" * 60)
 
         try:
-            # Load sheets with attachments
+            # Load sheets
             logger.info(f"📋 Loading source sheet: {self.source_sheet_id}")
             source_sheet = self.client.Sheets.get_sheet(
-                self.source_sheet_id, 
-                include=["attachments"]
+                self.source_sheet_id
             )
 
             logger.info(f"📋 Loading target sheet: {self.target_sheet_id}")
             target_sheet = self.client.Sheets.get_sheet(
-                self.target_sheet_id, 
-                include=["attachments"]
+                self.target_sheet_id
             )
 
             # Build row maps

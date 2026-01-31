@@ -138,7 +138,8 @@ class AttachmentSyncer:
             response.raise_for_status()
             with open(file_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                    if chunk:
+                        f.write(chunk)
 
         logger.debug(f"✅ Downloaded to: {file_path}")
         return file_path

@@ -80,11 +80,8 @@ def main():
         logger.error("❌ Exiting due to configuration errors")
         sys.exit(1)
 
-    # Ensure temp folder exists
-    os.makedirs(TEMP_DOWNLOAD_FOLDER, exist_ok=True)
-
     try:
-        # Initialize syncer
+        # Initialize syncer (it will create temp folder in __init__)
         syncer = AttachmentSyncer(
             api_key=SMARTSHEET_API_KEY,
             source_sheet_id=SOURCE_SHEET_ID,

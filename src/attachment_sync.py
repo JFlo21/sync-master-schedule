@@ -171,8 +171,20 @@ class AttachmentSyncer:
                     if att.attachment_type == "FILE"
                 ]
                 
-                attachment_cache[row_id] = file_attachments
-                logger.debug(f"Cached {len(file_attachments)} FILE attachments for row {row_id}")
+                # Fetch full details for each attachment to get the download URL
+                # The list_row_attachments method doesn't include URLs for security reasons
+                attachments_with_urls = []
+                for att in file_attachments:
+                    try:
+                        full_attachment = self.client.Attachments.get_attachment(
+                            sheet_id, att.id
+                        ).data
+                        attachments_with_urls.append(full_attachment)
+                    except Exception as e:
+                        logger.warning(f"Could not get details for attachment {att.id} on row {row_id}, will not be cached: {e}")
+                
+                attachment_cache[row_id] = attachments_with_urls
+                logger.debug(f"Cached {len(attachments_with_urls)} FILE attachments with URLs for row {row_id}")
                 
             except Exception as e:
                 logger.warning(f"Could not get attachments for row {row_id}: {e}")
@@ -258,11 +270,18 @@ class AttachmentSyncer:
                     source_sheet_id, source_row_id, include_all=True
                 ).data
 
-                # Filter to FILE type only
-                file_attachments = [
-                    att for att in source_attachments 
-                    if att.attachment_type == "FILE"
-                ]
+                # Filter to FILE type only and fetch full details to get URLs
+                file_attachments = []
+                for att in source_attachments:
+                    if att.attachment_type == "FILE":
+                        try:
+                            # Fetch full attachment details to get the download URL
+                            full_attachment = self.client.Attachments.get_attachment(
+                                source_sheet_id, att.id
+                            ).data
+                            file_attachments.append(full_attachment)
+                        except Exception as e:
+                            logger.warning(f"Could not get details for attachment {att.id}, will not be copied: {e}")
 
             if not file_attachments:
                 logger.debug(f"⏭️ No FILE attachments on source row {source_row_id}")

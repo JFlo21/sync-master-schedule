@@ -178,7 +178,7 @@ class AttachmentSyncer:
                     try:
                         full_attachment = self.client.Attachments.get_attachment(
                             sheet_id, att.id
-                        ).data
+                        )
                         attachments_with_urls.append(full_attachment)
                     except Exception as e:
                         logger.warning(f"Could not get details for attachment {att.id} on row {row_id}, will not be cached: {e}")
@@ -278,7 +278,7 @@ class AttachmentSyncer:
                             # Fetch full attachment details to get the download URL
                             full_attachment = self.client.Attachments.get_attachment(
                                 source_sheet_id, att.id
-                            ).data
+                            )
                             file_attachments.append(full_attachment)
                         except Exception as e:
                             logger.warning(f"Could not get details for attachment {att.id}, will not be copied: {e}")

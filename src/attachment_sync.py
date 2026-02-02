@@ -295,7 +295,7 @@ class AttachmentSyncer:
                         continue
 
                     # Fetch fresh URL just before downloading to avoid expiration issues
-                    # The cached attachment metadata doesn't include URLs, so we need to fetch them
+                    # This applies to both cached and non-cached paths to ensure URLs are always fresh
                     try:
                         full_attachment = self.client.Attachments.get_attachment(
                             source_sheet_id, attachment.id
@@ -303,7 +303,8 @@ class AttachmentSyncer:
                         download_url = full_attachment.url
                         mime_type = full_attachment.mime_type
                     except Exception as e:
-                        logger.warning(f"⚠️ Could not get fresh URL for attachment '{attachment.name}': {e}")
+                        logger.warning(f"⚠️ Could not get fresh URL for attachment '{attachment.name}' "
+                                     f"(ID: {attachment.id}, Sheet: {source_sheet_id}): {e}")
                         self.stats["attachments_skipped"] += 1
                         continue
 

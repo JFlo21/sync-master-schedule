@@ -147,17 +147,20 @@ class AttachmentSyncer:
     def _build_attachment_cache(self, sheet_id: str, row_ids: List[int]) -> Dict[int, List[Any]]:
         """
         Build a cache of attachments for multiple rows to reduce API calls.
+        
+        Note: This only caches basic attachment metadata (without URLs) to avoid
+        URL expiration issues. URLs are fetched just-in-time when needed.
 
         Args:
             sheet_id: Sheet ID
             row_ids: List of row IDs to fetch attachments for
 
         Returns:
-            Dictionary mapping row_id to list of attachment objects
+            Dictionary mapping row_id to list of attachment metadata (without URLs)
         """
         attachment_cache = {}
         
-        logger.info(f"📦 Pre-fetching attachments for {len(row_ids)} rows...")
+        logger.info(f"📦 Pre-fetching attachment metadata for {len(row_ids)} rows...")
         
         for row_id in row_ids:
             try:
@@ -165,32 +168,21 @@ class AttachmentSyncer:
                     sheet_id, row_id, include_all=True
                 ).data
                 
-                # Only cache FILE type attachments
+                # Only cache FILE type attachments (without fetching full details)
+                # We intentionally don't fetch URLs here to avoid expiration issues
                 file_attachments = [
                     att for att in attachments 
                     if att.attachment_type == "FILE"
                 ]
                 
-                # Fetch full details for each attachment to get the download URL
-                # The list_row_attachments method doesn't include URLs for security reasons
-                attachments_with_urls = []
-                for att in file_attachments:
-                    try:
-                        full_attachment = self.client.Attachments.get_attachment(
-                            sheet_id, att.id
-                        )
-                        attachments_with_urls.append(full_attachment)
-                    except Exception as e:
-                        logger.warning(f"Could not get details for attachment {att.id} on row {row_id}, will not be cached: {e}")
-                
-                attachment_cache[row_id] = attachments_with_urls
-                logger.debug(f"Cached {len(attachments_with_urls)} FILE attachments with URLs for row {row_id}")
+                attachment_cache[row_id] = file_attachments
+                logger.debug(f"Cached {len(file_attachments)} FILE attachment metadata for row {row_id}")
                 
             except Exception as e:
                 logger.warning(f"Could not get attachments for row {row_id}: {e}")
                 attachment_cache[row_id] = []
         
-        logger.info(f"✅ Attachment cache built for {len(attachment_cache)} rows")
+        logger.info(f"✅ Attachment metadata cache built for {len(attachment_cache)} rows")
         return attachment_cache
 
     def _get_existing_attachment_names(self, sheet_id: str, row_id: int) -> Set[str]:
@@ -264,24 +256,18 @@ class AttachmentSyncer:
         try:
             # Get source attachments from cache or fetch directly
             if source_attachment_cache is not None:
+                # Using cached metadata (without URLs to avoid expiration)
                 file_attachments = source_attachment_cache.get(source_row_id, [])
             else:
                 source_attachments = self.client.Attachments.list_row_attachments(
                     source_sheet_id, source_row_id, include_all=True
                 ).data
 
-                # Filter to FILE type only and fetch full details to get URLs
-                file_attachments = []
-                for att in source_attachments:
-                    if att.attachment_type == "FILE":
-                        try:
-                            # Fetch full attachment details to get the download URL
-                            full_attachment = self.client.Attachments.get_attachment(
-                                source_sheet_id, att.id
-                            )
-                            file_attachments.append(full_attachment)
-                        except Exception as e:
-                            logger.warning(f"Could not get details for attachment {att.id}, will not be copied: {e}")
+                # Filter to FILE type only
+                file_attachments = [
+                    att for att in source_attachments 
+                    if att.attachment_type == "FILE"
+                ]
 
             if not file_attachments:
                 logger.debug(f"⏭️ No FILE attachments on source row {source_row_id}")
@@ -308,8 +294,21 @@ class AttachmentSyncer:
                         self.stats["attachments_skipped"] += 1
                         continue
 
+                    # Fetch fresh URL just before downloading to avoid expiration issues
+                    # The cached attachment metadata doesn't include URLs, so we need to fetch them
+                    try:
+                        full_attachment = self.client.Attachments.get_attachment(
+                            source_sheet_id, attachment.id
+                        )
+                        download_url = full_attachment.url
+                        mime_type = full_attachment.mime_type
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not get fresh URL for attachment '{attachment.name}': {e}")
+                        self.stats["attachments_skipped"] += 1
+                        continue
+
                     # Validate attachment URL
-                    if not attachment.url or not str(attachment.url).strip():
+                    if not download_url or not str(download_url).strip():
                         logger.warning(f"⚠️ Skipping attachment '{attachment.name}' due to missing or invalid URL")
                         self.stats["attachments_skipped"] += 1
                         continue
@@ -317,7 +316,7 @@ class AttachmentSyncer:
                     # Download attachment
                     file_path = self._download_attachment(
                         attachment.name, 
-                        attachment.url
+                        download_url
                     )
 
                     # Upload to target row
@@ -326,7 +325,7 @@ class AttachmentSyncer:
                         self.client.Attachments.attach_file_to_row(
                             target_sheet_id,
                             target_row_id,
-                            (attachment.name, f, attachment.mime_type)
+                            (attachment.name, f, mime_type)
                         )
 
                     logger.info(f"✅ Successfully copied: {attachment.name}")

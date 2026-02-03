@@ -27,6 +27,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Error handling threshold - if error rate is below this, treat as success with warnings
+ERROR_RATE_THRESHOLD = 0.1  # 10%
+
 
 def validate_config():
     """
@@ -103,18 +106,18 @@ def main():
             # Perfect success - no errors at all
             logger.info("✅ Sync completed successfully!")
             sys.exit(0)
-        elif errors > 0 and total_operations > 0:
+        elif total_operations > 0:
             # Some errors but work was done - calculate error rate
             error_rate = errors / total_operations
             
-            if error_rate < 0.1:  # Less than 10% error rate
+            if error_rate < ERROR_RATE_THRESHOLD:
                 # Mostly successful - treat as success with warnings
-                logger.warning(f"⚠️ Sync completed with {errors} error(s) out of {total_operations} operations ({error_rate:.1%} error rate)")
+                logger.warning(f"⚠️ Sync completed with {errors} error(s) out of {total_operations} operations ({error_rate:.2%} error rate)")
                 logger.info("✅ Exiting with success - errors appear to be transient")
                 sys.exit(0)
             else:
                 # High error rate - treat as failure
-                logger.error(f"❌ Sync completed with {errors} error(s) out of {total_operations} operations ({error_rate:.1%} error rate)")
+                logger.error(f"❌ Sync completed with {errors} error(s) out of {total_operations} operations ({error_rate:.2%} error rate)")
                 logger.error("❌ Exiting with failure - error rate too high")
                 sys.exit(1)
         else:

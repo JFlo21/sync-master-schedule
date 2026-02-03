@@ -27,6 +27,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Error handling threshold - if error rate is below this, treat as success with warnings
+ERROR_RATE_THRESHOLD = 0.1  # 10%
+
 
 def validate_config():
     """
@@ -94,13 +97,33 @@ def main():
         # Run sync
         stats = syncer.sync_attachments()
 
-        # Exit with error code if there were errors
-        if stats.get("errors", 0) > 0:
-            logger.warning(f"⚠️ Sync completed with {stats['errors']} error(s)")
-            sys.exit(1)
-        else:
+        # Determine exit code based on error severity
+        errors = stats.get("errors", 0)
+        synced = stats.get("attachments_synced", 0)
+        total_operations = synced + errors
+        
+        if errors == 0:
+            # Perfect success - no errors at all
             logger.info("✅ Sync completed successfully!")
             sys.exit(0)
+        elif total_operations > 0:
+            # Some errors but work was done - calculate error rate
+            error_rate = errors / total_operations
+            
+            if error_rate < ERROR_RATE_THRESHOLD:
+                # Mostly successful - treat as success with warnings
+                logger.warning(f"⚠️ Sync completed with {errors} error(s) out of {total_operations} operations ({error_rate:.2%} error rate)")
+                logger.info("✅ Exiting with success - errors appear to be transient")
+                sys.exit(0)
+            else:
+                # High error rate - treat as failure
+                logger.error(f"❌ Sync completed with {errors} error(s) out of {total_operations} operations ({error_rate:.2%} error rate)")
+                logger.error("❌ Exiting with failure - error rate too high")
+                sys.exit(1)
+        else:
+            # No work done and errors occurred
+            logger.error(f"❌ Sync failed with {errors} error(s) and no successful operations")
+            sys.exit(1)
 
     except KeyboardInterrupt:
         logger.info("\n⚠️ Sync interrupted by user")

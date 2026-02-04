@@ -177,13 +177,27 @@ class AttachmentSyncer:
         
         def _do_download():
             # Use context manager for proper resource cleanup with timeout
-            with requests.get(url, stream=True, timeout=(10, 60)) as response:
-                response.raise_for_status()
-                with open(file_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-            return file_path
+            try:
+                with requests.get(url, stream=True, timeout=(10, 60)) as response:
+                    response.raise_for_status()
+                    with open(file_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                return file_path
+            except Exception:
+                # Best-effort cleanup of any partial/corrupt file left on disk
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                except OSError:
+                    # If cleanup fails, log and continue to propagate original error
+                    logger.warning(
+                        "Failed to remove partial download at %s after error during download.",
+                        file_path,
+                    )
+                # Re-raise so that retry logic and callers see the original failure
+                raise
         
         # Use retry logic for downloads
         result = self._retry_operation(_do_download, f"Download of {safe_name}")

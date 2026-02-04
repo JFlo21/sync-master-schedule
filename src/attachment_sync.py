@@ -3,6 +3,7 @@ Core attachment synchronization logic for Smartsheet.
 """
 import logging
 import os
+import time
 import smartsheet
 import requests
 from typing import Dict, Set, Optional, List, Any
@@ -22,7 +23,9 @@ class AttachmentSyncer:
         target_sheet_id: str,
         source_match_column_id: int,
         target_match_column_id: int,
-        temp_folder: str = "/tmp/smartsheet-attachments"
+        temp_folder: str = "/tmp/smartsheet-attachments",
+        max_retries: int = 3,
+        retry_delay: float = 2.0
     ):
         """
         Initialize the AttachmentSyncer.
@@ -34,6 +37,8 @@ class AttachmentSyncer:
             source_match_column_id: Column ID to match rows in source sheet
             target_match_column_id: Column ID to match rows in target sheet
             temp_folder: Temporary folder for downloading attachments
+            max_retries: Maximum number of retries for transient errors
+            retry_delay: Delay in seconds between retries (doubles each retry)
         """
         self.client = smartsheet.Smartsheet(api_key)
         self.client.errors_as_exceptions(True)
@@ -42,6 +47,8 @@ class AttachmentSyncer:
         self.source_match_column_id = source_match_column_id
         self.target_match_column_id = target_match_column_id
         self.temp_folder = temp_folder
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
 
         # Statistics
         self.stats = {
@@ -116,9 +123,50 @@ class AttachmentSyncer:
         logger.info(f"Built row map with {len(row_map)} entries")
         return row_map
 
+    def _retry_operation(self, operation, operation_name: str, *args, **kwargs):
+        """
+        Retry an operation with exponential backoff for transient errors.
+        
+        Args:
+            operation: Function to execute
+            operation_name: Name of the operation for logging
+            *args, **kwargs: Arguments to pass to the operation
+            
+        Returns:
+            Result of the operation
+            
+        Raises:
+            Exception: If all retries are exhausted
+        """
+        last_exception = None
+        delay = self.retry_delay
+        
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                return operation(*args, **kwargs)
+            except (requests.exceptions.RequestException, 
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError) as e:
+                last_exception = e
+                if attempt < self.max_retries:
+                    logger.warning(f"⚠️ {operation_name} failed (attempt {attempt}/{self.max_retries}): {e}")
+                    logger.info(f"   Retrying in {delay:.1f} seconds...")
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                else:
+                    logger.error(f"❌ {operation_name} failed after {self.max_retries} attempts: {e}")
+                    raise
+            except Exception as e:
+                # For non-transient errors, don't retry
+                logger.error(f"❌ {operation_name} failed with non-retryable error: {e}")
+                raise
+        
+        # Should never reach here, but just in case
+        raise last_exception
+
     def _download_attachment(self, name: str, url: str) -> str:
         """
-        Download file to temp storage.
+        Download file to temp storage with retry logic.
 
         Args:
             name: Filename
@@ -133,16 +181,20 @@ class AttachmentSyncer:
         
         logger.debug(f"📥 Downloading attachment: {safe_name}")
         
-        # Use context manager for proper resource cleanup with timeout
-        with requests.get(url, stream=True, timeout=(10, 60)) as response:
-            response.raise_for_status()
-            with open(file_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-
+        def _do_download():
+            # Use context manager for proper resource cleanup with timeout
+            with requests.get(url, stream=True, timeout=(10, 60)) as response:
+                response.raise_for_status()
+                with open(file_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+            return file_path
+        
+        # Use retry logic for downloads
+        result = self._retry_operation(_do_download, f"Download of {safe_name}")
         logger.debug(f"✅ Downloaded to: {file_path}")
-        return file_path
+        return result
 
     def _build_attachment_cache(self, sheet_id: str, row_ids: List[int]) -> Dict[int, List[Any]]:
         """
@@ -297,8 +349,14 @@ class AttachmentSyncer:
                     # Fetch fresh URL just before downloading to avoid expiration issues
                     # This applies to both cached and non-cached paths to ensure URLs are always fresh
                     try:
-                        full_attachment = self.client.Attachments.get_attachment(
-                            source_sheet_id, attachment.id
+                        def _get_attachment():
+                            return self.client.Attachments.get_attachment(
+                                source_sheet_id, attachment.id
+                            )
+                        
+                        full_attachment = self._retry_operation(
+                            _get_attachment,
+                            f"Get attachment details for '{attachment.name}'"
                         )
                         download_url = full_attachment.url
                         mime_type = full_attachment.mime_type
@@ -314,20 +372,27 @@ class AttachmentSyncer:
                         self.stats["attachments_skipped"] += 1
                         continue
 
-                    # Download attachment
+                    # Download attachment (with built-in retry)
                     file_path = self._download_attachment(
                         attachment.name, 
                         download_url
                     )
 
-                    # Upload to target row
+                    # Upload to target row (with retry)
                     logger.info(f"📤 Uploading {attachment.name} to target row {target_row_id}")
-                    with open(file_path, 'rb') as f:
-                        self.client.Attachments.attach_file_to_row(
-                            target_sheet_id,
-                            target_row_id,
-                            (attachment.name, f, mime_type)
-                        )
+                    
+                    def _upload_attachment():
+                        with open(file_path, 'rb') as f:
+                            return self.client.Attachments.attach_file_to_row(
+                                target_sheet_id,
+                                target_row_id,
+                                (attachment.name, f, mime_type)
+                            )
+                    
+                    self._retry_operation(
+                        _upload_attachment,
+                        f"Upload of {attachment.name}"
+                    )
 
                     logger.info(f"✅ Successfully copied: {attachment.name}")
                     copied_count += 1

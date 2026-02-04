@@ -24,7 +24,7 @@ class AttachmentSyncer:
         source_match_column_id: int,
         target_match_column_id: int,
         temp_folder: str = "/tmp/smartsheet-attachments",
-        max_retries: int = 3,
+        max_attempts: int = 3,
         retry_delay: float = 2.0
     ):
         """
@@ -37,8 +37,8 @@ class AttachmentSyncer:
             source_match_column_id: Column ID to match rows in source sheet
             target_match_column_id: Column ID to match rows in target sheet
             temp_folder: Temporary folder for downloading attachments
-            max_retries: Maximum number of retries for transient errors
-            retry_delay: Delay in seconds between retries (doubles each retry)
+            max_attempts: Maximum number of attempts for transient errors (default 3)
+            retry_delay: Initial delay in seconds between retries (doubles each retry)
         """
         self.client = smartsheet.Smartsheet(api_key)
         self.client.errors_as_exceptions(True)
@@ -47,7 +47,7 @@ class AttachmentSyncer:
         self.source_match_column_id = source_match_column_id
         self.target_match_column_id = target_match_column_id
         self.temp_folder = temp_folder
-        self.max_retries = max_retries
+        self.max_attempts = max_attempts
         self.retry_delay = retry_delay
 
         # Statistics
@@ -136,25 +136,34 @@ class AttachmentSyncer:
             Result of the operation
             
         Raises:
-            Exception: If all retries are exhausted
+            Exception: If all attempts are exhausted
         """
         delay = self.retry_delay
         
-        for attempt in range(self.max_retries):
+        # Smartsheet SDK exceptions that indicate transient errors we should retry
+        retryable_smartsheet_errors = (
+            smartsheet.exceptions.RateLimitExceededError,
+            smartsheet.exceptions.InternalServerError,
+            smartsheet.exceptions.ServerTimeoutExceededError,
+            smartsheet.exceptions.SystemMaintenanceError,
+            smartsheet.exceptions.UnexpectedErrorShouldRetryError,
+        )
+        
+        for attempt in range(self.max_attempts):
             try:
                 return operation(*args, **kwargs)
-            except requests.exceptions.RequestException as e:
-                # RequestException covers Timeout, ConnectionError, and other network issues
-                if attempt < self.max_retries - 1:
-                    logger.warning(f"⚠️ {operation_name} failed (attempt {attempt + 1}/{self.max_retries}): {e}")
+            except (requests.exceptions.RequestException, *retryable_smartsheet_errors) as e:
+                # Retry for network errors and transient Smartsheet API errors
+                if attempt < self.max_attempts - 1:
+                    logger.warning(f"⚠️ {operation_name} failed (attempt {attempt + 1}/{self.max_attempts}): {e}")
                     logger.info(f"   Retrying in {delay:.1f} seconds...")
                     time.sleep(delay)
                     delay *= 2  # Exponential backoff
                 else:
-                    logger.error(f"❌ {operation_name} failed after {self.max_retries} attempts: {e}")
+                    logger.error(f"❌ {operation_name} failed after {self.max_attempts} attempts: {e}")
                     raise
             except Exception as e:
-                # For non-transient errors, don't retry
+                # For other non-transient errors, don't retry
                 logger.error(f"❌ {operation_name} failed with non-retryable error: {e}")
                 raise
 
@@ -369,15 +378,15 @@ class AttachmentSyncer:
                         download_url = full_attachment.url
                         mime_type = full_attachment.mime_type
                     except Exception as e:
-                        logger.warning(f"⚠️ Could not get fresh URL for attachment '{attachment.name}' "
-                                     f"(ID: {attachment.id}, Sheet: {source_sheet_id}): {e}")
-                        self.stats["attachments_skipped"] += 1
+                        logger.error(f"❌ Could not get attachment details for '{attachment.name}' "
+                                   f"(ID: {attachment.id}, Sheet: {source_sheet_id}): {e}")
+                        self.stats["errors"] += 1
                         continue
 
                     # Validate attachment URL
                     if not download_url or not str(download_url).strip():
-                        logger.warning(f"⚠️ Skipping attachment '{attachment.name}' due to missing or invalid URL")
-                        self.stats["attachments_skipped"] += 1
+                        logger.error(f"❌ Attachment '{attachment.name}' has missing or invalid URL")
+                        self.stats["errors"] += 1
                         continue
 
                     # Download attachment (with built-in retry)

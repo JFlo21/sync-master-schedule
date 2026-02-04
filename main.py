@@ -104,6 +104,9 @@ def main():
         skipped = stats.get("attachments_skipped", 0)
         rows_processed = stats.get("total_rows_processed", 0)
         
+        # Log processing statistics
+        logger.info(f"📊 Processed {rows_processed} row(s) with matching keys")
+        
         # Total operations includes synced, skipped, and errors
         # This gives us a true picture of the work done
         total_operations = synced + skipped + errors

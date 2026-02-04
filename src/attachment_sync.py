@@ -149,10 +149,13 @@ class AttachmentSyncer:
             smartsheet.exceptions.UnexpectedErrorShouldRetryError,
         )
         
+        # Combine network and Smartsheet transient errors for exception handling
+        retryable_errors = (requests.exceptions.RequestException,) + retryable_smartsheet_errors
+        
         for attempt in range(self.max_attempts):
             try:
                 return operation(*args, **kwargs)
-            except (requests.exceptions.RequestException, *retryable_smartsheet_errors) as e:
+            except retryable_errors as e:
                 # Retry for network errors and transient Smartsheet API errors
                 if attempt < self.max_attempts - 1:
                     logger.warning(f"⚠️ {operation_name} failed (attempt {attempt + 1}/{self.max_attempts}): {e}")

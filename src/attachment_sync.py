@@ -138,18 +138,15 @@ class AttachmentSyncer:
         Raises:
             Exception: If all retries are exhausted
         """
-        last_exception = None
         delay = self.retry_delay
         
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(self.max_retries):
             try:
                 return operation(*args, **kwargs)
-            except (requests.exceptions.RequestException, 
-                    requests.exceptions.Timeout,
-                    requests.exceptions.ConnectionError) as e:
-                last_exception = e
-                if attempt < self.max_retries:
-                    logger.warning(f"⚠️ {operation_name} failed (attempt {attempt}/{self.max_retries}): {e}")
+            except requests.exceptions.RequestException as e:
+                # RequestException covers Timeout, ConnectionError, and other network issues
+                if attempt < self.max_retries - 1:
+                    logger.warning(f"⚠️ {operation_name} failed (attempt {attempt + 1}/{self.max_retries}): {e}")
                     logger.info(f"   Retrying in {delay:.1f} seconds...")
                     time.sleep(delay)
                     delay *= 2  # Exponential backoff
@@ -160,9 +157,6 @@ class AttachmentSyncer:
                 # For non-transient errors, don't retry
                 logger.error(f"❌ {operation_name} failed with non-retryable error: {e}")
                 raise
-        
-        # Should never reach here, but just in case
-        raise last_exception
 
     def _download_attachment(self, name: str, url: str) -> str:
         """

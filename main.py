@@ -130,8 +130,8 @@ def main():
                 sys.exit(0)
             else:
                 # High error rate - but only fail if it's truly concerning
-                # If we processed rows but just had some attachment errors, that's still partial success
-                if rows_processed > 0 and (synced > 0 or skipped > 0):
+                # If we made progress (synced or skipped attachments), that's still partial success
+                if synced > 0 or skipped > 0:
                     logger.warning("⚠️ Error rate is high, but sync made progress")
                     logger.warning("   Treating as success with warnings to prevent workflow failure")
                     logger.info("✅ Exiting with success despite elevated error rate")

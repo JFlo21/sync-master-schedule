@@ -1,3 +1,5 @@
+[![Smartsheet Attachment Sync](https://github.com/JFlo21/sync-master-schedule/actions/workflows/sync-attachments.yml/badge.svg)](https://github.com/JFlo21/sync-master-schedule/actions/workflows/sync-attachments.yml)
+
 # Smartsheet Attachment Sync
 
 Automatically synchronize attachments between two Smartsheet sheets based on matching column criteria. Runs daily at 5:00 AM UTC via GitHub Actions.

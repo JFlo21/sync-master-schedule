@@ -6,6 +6,7 @@ network, no real sleeping.
 import dataclasses
 import logging
 import os
+import re
 import tempfile
 import unittest
 from collections import defaultdict
@@ -477,9 +478,9 @@ class ConstructionTests(SyncTestCase):
 
 
 class PreflightTests(SyncTestCase):
-    def run_expecting_routing_error(self, world):
+    def run_expecting_routing_error(self, world, pattern=""):
         syncer = self.make_syncer(world)
-        with self.assertRaises(RoutingError):
+        with self.assertRaisesRegex(RoutingError, pattern):
             syncer.sync_attachments(apply=True)
         self.upload.Attachments.attach_file_to_row.assert_not_called()
         self.read.Attachments.list_row_attachments.assert_not_called()
@@ -500,6 +501,30 @@ class PreflightTests(SyncTestCase):
 
     def test_source_column_with_wrong_title(self):
         self.run_expecting_routing_error(self.make_world(["1"], ["1"], source_title="Row ID"))
+
+    # BUG-014: the pinned title is compared exactly; a padded title is a different title
+    def test_padded_match_column_title_is_rejected(self):
+        for route in (BLANK_ROUTE, MASTER_ROUTE):
+            for side in ("source", "target"):
+                pinned = getattr(route, f"{side}_match_column_title")
+                for title in (f" {pinned}", f"{pinned} ", f"{pinned}\t", f"{pinned}\n"):
+                    with self.subTest(route=route.name, side=side, title=title):
+                        world = self.make_world(["1"], ["1"], route=route, **{f"{side}_title": title})
+                        world.add_file(SRC, 1000, "a.pdf")
+                        self.run_expecting_routing_error(
+                            world, "is titled " + re.escape(repr(title))
+                        )
+
+    def test_match_column_title_is_case_sensitive(self):
+        for kwargs in (
+            {"target_title": "work request #"},
+            {"source_title": "Work request #"},
+            {"route": MASTER_ROUTE, "target_title": "Wr"},
+        ):
+            with self.subTest(**{k: getattr(v, "name", v) for k, v in kwargs.items()}):
+                self.run_expecting_routing_error(
+                    self.make_world(["1"], ["1"], **kwargs), "is titled"
+                )
 
     def test_incomplete_sheet_load(self):
         world = self.make_world(["1"], ["1"])

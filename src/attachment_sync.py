@@ -990,7 +990,9 @@ class AttachmentSyncer:
             raise RoutingError(
                 f"{route}: {label} match column {match_column_id} not found in sheet {expected_sheet_id}"
             )
-        title = str(column.title or "").strip()
+        # Exact comparison: no trimming and no case folding. A padded title is a
+        # different title, and a missing title never equals the pinned one.
+        title = column.title
         if title != expected_title:
             raise RoutingError(
                 f"{route}: {label} match column {match_column_id} is titled {title!r}, "

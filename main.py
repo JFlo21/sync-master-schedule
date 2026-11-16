@@ -1,9 +1,16 @@
 """
 Entry point for Smartsheet Attachment Sync.
+
+Copies PDF file attachments from Project List rows to the matching existing rows
+of Project List - Blank Copy (matched by Work Request #).
+
+    python main.py --dry-run   # plan only (default): no downloads, no uploads
+    python main.py --apply     # download, verify and upload PDFs
 """
+import argparse
 import logging
-import sys
 import os
+import sys
 from dotenv import load_dotenv
 
 # Load environment variables from .env file (for local development)
@@ -15,9 +22,10 @@ from src.config import (
     TARGET_SHEET_ID,
     SOURCE_MATCH_COLUMN_ID,
     TARGET_MATCH_COLUMN_ID,
-    TEMP_DOWNLOAD_FOLDER
+    TEMP_DOWNLOAD_FOLDER,
+    validate_routing,
 )
-from src.attachment_sync import AttachmentSyncer
+from src.attachment_sync import AttachmentSyncer, RoutingError
 
 # Configure logging
 logging.basicConfig(
@@ -25,17 +33,41 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+# The SDK logs request URLs at INFO and full response bodies at DEBUG (a
+# get_attachment response contains a signed download URL). Keep both quiet even
+# if the root level is raised to DEBUG.
+logging.getLogger("smartsheet").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Error handling threshold - if error rate is below this, treat as success with warnings
-# This allows for transient errors (network issues, rate limits, etc.) without failing the workflow
-ERROR_RATE_THRESHOLD = 0.1  # 10% - allows up to 10% of operations to fail while still succeeding
+
+def parse_args(argv=None):
+    """Parse the explicit dry-run / apply mode."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Copy PDF file attachments from Project List rows to the matching existing rows "
+            "of Project List - Blank Copy, matched by Work Request #. Attachment-only: "
+            "rows and cells are never written. Defaults to a dry run."
+        )
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan only (default): match rows and list PDF candidates; no downloads, no uploads.",
+    )
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Download, verify and upload eligible PDFs to the matching target rows.",
+    )
+    return parser.parse_args(argv)
 
 
 def validate_config():
     """
     Validate required configuration values.
-    
+
     Returns:
         bool: True if configuration is valid, False otherwise
     """
@@ -46,11 +78,10 @@ def validate_config():
     elif len(SMARTSHEET_API_KEY.strip()) < 20:
         errors.append("❌ SMARTSHEET_API_KEY appears to be invalid (too short)")
 
-    if not SOURCE_SHEET_ID or not SOURCE_SHEET_ID.strip():
-        errors.append("❌ SOURCE_SHEET_ID is required but not set")
-
-    if not TARGET_SHEET_ID or not TARGET_SHEET_ID.strip():
-        errors.append("❌ TARGET_SHEET_ID is required but not set")
+    for problem in validate_routing(
+        SOURCE_SHEET_ID, TARGET_SHEET_ID, SOURCE_MATCH_COLUMN_ID, TARGET_MATCH_COLUMN_ID
+    ):
+        errors.append(f"❌ Routing: {problem}")
 
     if errors:
         logger.error("Configuration validation failed:")
@@ -58,7 +89,7 @@ def validate_config():
             logger.error(error)
         logger.error("\nPlease set the required environment variables.")
         logger.error("For local development: see .env.example")
-        logger.error("For GitHub Actions: set repository secrets in Settings → Secrets and variables → Actions")
+        logger.error("For GitHub Actions: only SMARTSHEET_API_KEY is a secret; routing IDs are set in the workflow")
         return False
 
     # Log configuration (without sensitive data)
@@ -73,19 +104,38 @@ def validate_config():
     return True
 
 
-def main():
+def main(argv=None) -> int:
     """
     Main entry point for the attachment sync application.
+
+    Returns:
+        Process exit status: 0 when no unresolved errors, 1 otherwise,
+        130 when interrupted.
     """
+    args = parse_args(argv)
+    apply = bool(args.apply)
+
+    # A workflow that passes no flag would otherwise become a silent daily dry run.
+    if not args.apply and not args.dry_run and os.environ.get("GITHUB_ACTIONS") == "true":
+        logger.error(
+            "❌ No mode flag in GitHub Actions; the workflow must pass --dry-run or --apply"
+        )
+        return 1
+
     logger.info("🚀 Smartsheet Attachment Sync - Starting")
-    
+    if apply:
+        logger.info("Mode: APPLY (eligible PDFs will be uploaded to the target sheet)")
+    elif args.dry_run:
+        logger.info("Mode: DRY RUN (no downloads, no uploads)")
+    else:
+        logger.info("Mode: DRY RUN (default - no mode flag given; use --apply to upload)")
+
     # Validate configuration
     if not validate_config():
         logger.error("❌ Exiting due to configuration errors")
-        sys.exit(1)
+        return 1
 
     try:
-        # Initialize syncer (it will create temp folder in __init__)
         syncer = AttachmentSyncer(
             api_key=SMARTSHEET_API_KEY,
             source_sheet_id=SOURCE_SHEET_ID,
@@ -96,67 +146,28 @@ def main():
         )
 
         # Run sync
-        stats = syncer.sync_attachments()
-
-        # Determine exit code based on error severity
-        errors = stats.get("errors", 0)
-        synced = stats.get("attachments_synced", 0)
-        skipped = stats.get("attachments_skipped", 0)
-        rows_processed = stats.get("total_rows_processed", 0)
-        
-        # Log processing statistics
-        logger.info(f"📊 Processed {rows_processed} row(s) with matching keys")
-        
-        # Total operations includes synced, skipped, and errors
-        # This gives us a true picture of the work done
-        total_operations = synced + skipped + errors
-        
-        if errors == 0:
-            # Perfect success - no errors at all
-            logger.info("✅ Sync completed successfully!")
-            sys.exit(0)
-        elif total_operations > 0:
-            # Some errors occurred - calculate error rate against all operations
-            error_rate = errors / total_operations
-            
-            # Log the error details
-            logger.warning(f"⚠️ Sync completed with {errors} error(s) out of {total_operations} total operations")
-            logger.warning(f"   - Attachments synced: {synced}")
-            logger.warning(f"   - Attachments skipped (duplicates): {skipped}")
-            logger.warning(f"   - Errors: {errors}")
-            logger.warning(f"   - Error rate: {error_rate:.2%}")
-            
-            if error_rate < ERROR_RATE_THRESHOLD:
-                # Mostly successful - treat as success with warnings
-                logger.info("✅ Exiting with success - error rate is acceptable")
-                logger.info("   Most operations completed successfully; errors appear to be transient")
-                sys.exit(0)
-            else:
-                # High error rate - but only fail if it's truly concerning
-                # If we made progress (synced or skipped attachments), that's still partial success
-                if synced > 0 or skipped > 0:
-                    logger.warning("⚠️ Error rate is high, but sync made progress")
-                    logger.warning("   Treating as success with warnings to prevent workflow failure")
-                    logger.info("✅ Exiting with success despite elevated error rate")
-                    sys.exit(0)
-                else:
-                    # True failure - high error rate and no meaningful work done
-                    logger.error(f"❌ Sync failed with high error rate and no progress")
-                    logger.error("❌ Exiting with failure")
-                    sys.exit(1)
-        else:
-            # No work attempted but errors occurred - this is a configuration or setup issue
-            logger.error(f"❌ Sync failed with {errors} error(s) and no operations attempted")
-            logger.error("   This may indicate a configuration or connectivity problem")
-            sys.exit(1)
+        stats = syncer.sync_attachments(apply=apply)
 
     except KeyboardInterrupt:
         logger.info("\n⚠️ Sync interrupted by user")
-        sys.exit(130)
+        return 130
+    except RoutingError as e:
+        logger.error(f"❌ Routing check failed, nothing was written: {e}")
+        return 1
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+        return 1
+
+    errors = stats.get("errors", 0)
+    if errors == 0:
+        logger.info("✅ Sync completed with no errors")
+        return 0
+
+    # Expected skips (invalid placeholders, unmatched WRs, existing filenames)
+    # are not errors; anything counted here is an unresolved operational error.
+    logger.error(f"❌ Sync finished with {errors} unresolved error(s) - exiting with status 1")
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

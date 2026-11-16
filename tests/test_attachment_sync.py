@@ -1,7 +1,9 @@
 """
-Focused tests for the PDF attachment sync. Offline: Smartsheet clients, downloads
-and time are all mocked; no credentials, no network, no real sleeping.
+Focused tests for the attachment sync (pdf_only and all_files routes). Offline:
+Smartsheet clients, downloads and time are all mocked; no credentials, no
+network, no real sleeping.
 """
+import dataclasses
 import logging
 import os
 import tempfile
@@ -31,15 +33,24 @@ from src.attachment_sync import (
     has_pdf_signature,
     has_unsupported_filename_chars,
     normalize_work_request,
+    upload_mime_type,
 )
+from src.config import FILE_RULE_ALL, FILE_RULE_PDF_ONLY, VERIFIED_ROUTES, Route
 
 SRC = 1553121697288068
-TGT = 573385022328708
+TGT = 573385022328708            # Project List - Blank Copy (pdf_only)
 SRC_COL = 8022925527175044
 TGT_COL = 7068369005875076
-OLD_TGT = 4850043816202116
-OLD_TGT_COL = 1437881091182468
+MASTER = 4850043816202116        # master schedule (all_files)
+MASTER_COL = 1437881091182468
 OTHER_COL = 111
+
+WR_TITLE = "Work Request #"
+BLANK_ROUTE = Route("blank-copy", SRC, TGT, SRC_COL, TGT_COL, FILE_RULE_PDF_ONLY, WR_TITLE, WR_TITLE)
+MASTER_ROUTE = Route("master-schedule", SRC, MASTER, SRC_COL, MASTER_COL, FILE_RULE_ALL, WR_TITLE, "WR")
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+XLSX_BYTES = b"PK\x03\x04 xlsx body"
+PNG_BYTES = b"\x89PNG\r\n\x1a\n image body"
 API_KEY = "test-key-not-real-0123456789"
 
 PDF_BYTES = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF\n"
@@ -122,12 +133,18 @@ class FakeResponse:
 class FakeWorld:
     """In-memory Smartsheet + download host."""
 
-    def __init__(self, clock, source_values, target_values, source_title="Work Request #",
-                 target_title="Work Request #"):
+    def __init__(self, clock, source_values, target_values, source_title=None,
+                 target_title=None, route=BLANK_ROUTE):
         self.clock = clock
+        self.route = route
+        self.target = route.target_sheet_id
+        # Live titles default to the route's pinned titles
+        source_title = route.source_match_column_title if source_title is None else source_title
+        target_title = route.target_match_column_title if target_title is None else target_title
         self.sheets = {
             SRC: make_sheet(SRC, SRC_COL, source_values, 1000, source_title),
-            TGT: make_sheet(TGT, TGT_COL, target_values, 5000, target_title),
+            self.target: make_sheet(self.target, route.target_match_column_id, target_values,
+                                    5000, target_title),
         }
         self.row_attachments = defaultdict(list)
         self.details = {}
@@ -255,9 +272,8 @@ class SyncTestCase(unittest.TestCase):
         return FakeWorld(self.clock, source_values, target_values, **kwargs)
 
     def make_syncer(self, world, **kwargs):
-        syncer = AttachmentSyncer(
-            API_KEY, SRC, TGT, SRC_COL, TGT_COL, temp_folder=self.temp_folder, **kwargs
-        )
+        syncer = AttachmentSyncer(API_KEY, world.route, temp_folder=self.temp_folder, **kwargs)
+        self.target = world.target
         read, upload = self.factory.created[-2][0], self.factory.created[-1][0]
         read.Sheets.get_sheet.side_effect = world.get_sheet
         read.Attachments.list_row_attachments.side_effect = world.list_row_attachments
@@ -280,7 +296,7 @@ class SyncTestCase(unittest.TestCase):
         self.read.Attachments.attach_file_to_row.assert_not_called()
         for call in self.upload.Attachments.attach_file_to_row.call_args_list:
             sheet_id, row_id = call.args[0], call.args[1]
-            self.assertEqual(sheet_id, TGT)
+            self.assertEqual(sheet_id, self.target)
             self.assertIn(row_id, matched_target_rows)
         upload_other = {c[0] for c in self.upload.mock_calls} - CLIENT_CONFIG_CALLS
         self.assertLessEqual(upload_other, {"Attachments.attach_file_to_row"})
@@ -377,19 +393,56 @@ class ConstructionTests(SyncTestCase):
         self.assertEqual(up_args, (API_KEY,))
 
     def test_wrong_routing_rejected_before_clients_exist(self):
-        bad_routings = [
-            (SRC, OLD_TGT, SRC_COL, OLD_TGT_COL),   # old configured target
-            (SRC, TGT, SRC_COL, OLD_TGT_COL),       # old target column
-            (SRC, SRC, SRC_COL, TGT_COL),           # same-sheet routing
-            (TGT, SRC, TGT_COL, SRC_COL),           # swapped
-            (SRC, 999, SRC_COL, TGT_COL),           # unknown target
-            (SRC, "not-a-number", SRC_COL, TGT_COL),
+        bad_routes = [
+            dataclasses.replace(BLANK_ROUTE, file_rule=FILE_RULE_ALL),        # Blank Copy + all files
+            dataclasses.replace(MASTER_ROUTE, file_rule=FILE_RULE_PDF_ONLY),  # master + pdf only
+            dataclasses.replace(BLANK_ROUTE, target_match_column_id=MASTER_COL),
+            dataclasses.replace(MASTER_ROUTE, target_match_column_id=TGT_COL),
+            dataclasses.replace(BLANK_ROUTE, target_sheet_id=SRC),            # same-sheet routing
+            Route("swapped", TGT, SRC, TGT_COL, SRC_COL, FILE_RULE_PDF_ONLY, WR_TITLE, WR_TITLE),
+            dataclasses.replace(MASTER_ROUTE, target_match_column_title=WR_TITLE),  # wrong title
+            dataclasses.replace(BLANK_ROUTE, target_match_column_title="WR"),
+            dataclasses.replace(BLANK_ROUTE, source_match_column_title="WR"),
+            dataclasses.replace(BLANK_ROUTE, target_sheet_id=999),            # unknown target
+            dataclasses.replace(BLANK_ROUTE, target_sheet_id="not-a-number"),
+            dataclasses.replace(BLANK_ROUTE, target_sheet_id=str(TGT)),       # non-integer ID
+            dataclasses.replace(BLANK_ROUTE, name="other"),
+            (SRC, TGT, SRC_COL, TGT_COL),                                     # not a Route
         ]
-        for routing in bad_routings:
-            with self.subTest(routing=routing):
+        for route in bad_routes:
+            with self.subTest(route=route):
                 with self.assertRaises(RoutingError):
-                    AttachmentSyncer(API_KEY, *routing, temp_folder=self.temp_folder)
+                    AttachmentSyncer(API_KEY, route, temp_folder=self.temp_folder)
         self.assertEqual(self.factory.created, [])
+
+    def test_unknown_file_rule_fails_closed_before_clients_exist(self):
+        from src import config
+        for rule in ("pdf-only", None):
+            typo = dataclasses.replace(BLANK_ROUTE, file_rule=rule)
+            with self.subTest(rule=rule, layer="validate_route"):
+                with mock.patch.object(config, "VERIFIED_ROUTES", (MASTER_ROUTE, typo)):
+                    with self.assertRaises(RoutingError) as ctx:
+                        AttachmentSyncer(API_KEY, typo, temp_folder=self.temp_folder)
+                self.assertIn("unknown file rule", str(ctx.exception))
+            with self.subTest(rule=rule, layer="explicit syncer check"):
+                # Even if route validation were bypassed, the syncer refuses the rule.
+                with mock.patch.object(attachment_sync, "validate_route", return_value=[]):
+                    with self.assertRaises(RoutingError) as ctx:
+                        AttachmentSyncer(API_KEY, typo, temp_folder=self.temp_folder)
+                self.assertIn("unknown file rule", str(ctx.exception))
+        self.assertEqual(self.factory.created, [])
+
+    def test_each_verified_route_constructs(self):
+        for route in VERIFIED_ROUTES:
+            with self.subTest(route=route.name):
+                syncer = AttachmentSyncer(API_KEY, route, temp_folder=self.temp_folder)
+                self.assertEqual(
+                    (syncer.source_sheet_id, syncer.target_sheet_id,
+                     syncer.source_match_column_id, syncer.target_match_column_id),
+                    (route.source_sheet_id, route.target_sheet_id,
+                     route.source_match_column_id, route.target_match_column_id),
+                )
+        self.assertEqual(len(self.factory.created), 4)  # read + upload client per route
 
     def test_temp_folder_not_created_at_init(self):
         self.make_syncer(self.make_world([], []))
@@ -410,7 +463,7 @@ class PreflightTests(SyncTestCase):
 
     def test_api_returns_different_sheet(self):
         world = self.make_world(["1"], ["1"])
-        world.sheets[TGT].id = OLD_TGT
+        world.sheets[TGT].id = MASTER
         self.run_expecting_routing_error(world)
 
     def test_missing_match_column(self):
@@ -429,6 +482,40 @@ class PreflightTests(SyncTestCase):
         world.sheets[SRC].total_row_count = 5
         self.run_expecting_routing_error(world)
 
+    def test_blank_copy_requires_work_request_title_on_both_sides(self):
+        for kwargs in ({"target_title": "WR"}, {"source_title": "WR"}):
+            with self.subTest(**kwargs):
+                self.run_expecting_routing_error(self.make_world(["1"], ["1"], **kwargs))
+
+    def test_master_schedule_preflight_passes_with_wr_title(self):
+        world = self.make_world([111], [111], route=MASTER_ROUTE)
+        self.assertEqual(world.sheets[MASTER].columns[1].title, "WR")
+        world.add_file(SRC, 1000, "a.xlsx", mime=XLSX_MIME)
+        with self.assertLogs("src.attachment_sync", level="INFO") as logs:
+            stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual(stats["errors"], 0)
+        self.assertEqual(stats["uploads_confirmed"], 1)
+        text = "\n".join(logs.output)
+        self.assertIn(f"Target preflight OK: sheet {MASTER}, column {MASTER_COL} 'WR'", text)
+        self.assertIn(f"Source preflight OK: sheet {SRC}, column {SRC_COL} 'Work Request #'", text)
+
+    def test_master_schedule_titles_are_not_interchangeable(self):
+        cases = (
+            ("target", {"target_title": "Work Request #"}, MASTER_COL, "Work Request #", "WR"),
+            ("source", {"source_title": "WR"}, SRC_COL, "WR", "Work Request #"),
+        )
+        for side, kwargs, column, actual, expected in cases:
+            with self.subTest(side=side):
+                world = self.make_world([111], [111], route=MASTER_ROUTE, **kwargs)
+                syncer = self.make_syncer(world)
+                with self.assertRaises(RoutingError) as ctx:
+                    syncer.sync_attachments(apply=True)
+                message = str(ctx.exception)
+                for part in ("master-schedule", str(column), repr(actual), repr(expected)):
+                    self.assertIn(part, message)
+                self.upload.Attachments.attach_file_to_row.assert_not_called()
+                self.read.Attachments.list_row_attachments.assert_not_called()
+
 
 # ------------------------------------------------------------------- matching
 
@@ -440,7 +527,7 @@ class MatchingTests(SyncTestCase):
         syncer = self.make_syncer(world)
         stats = syncer.sync_attachments(apply=False)
         self.assertEqual(stats["wr_matched"], 1)
-        self.assertEqual(stats["pdf_planned"], 1)
+        self.assertEqual(stats["files_planned"], 1)
 
     def test_placeholders_are_skipped_not_matched(self):
         source = ["WR-01", "WR-01", "WR-02", "CANCELED", "Canceled", None, "", 1.5, True]
@@ -608,7 +695,7 @@ class DuplicatePolicyTests(SyncTestCase):
                 syncer = self.make_syncer(world)
                 stats = syncer.sync_attachments(apply=apply)
                 self.assertEqual(stats["skipped_duplicate_source_filename"], 1)
-                self.assertEqual(stats["pdf_planned"], 1)
+                self.assertEqual(stats["files_planned"], 1)
                 self.assertEqual(len(world.uploads), 1 if apply else 0)
 
     def test_repeat_run_adds_nothing(self):
@@ -821,7 +908,7 @@ class DownloadAndDryRunTests(SyncTestCase):
         self.upload.Attachments.attach_file_to_row.assert_not_called()
         self.requests_get.assert_not_called()
         self.assertFalse(os.path.exists(self.temp_folder))
-        self.assertEqual(stats["pdf_planned"], 4)
+        self.assertEqual(stats["files_planned"], 4)
         self.assertEqual(stats["pdf_content_verified"], 0)
         self.assertEqual(stats["uploads_confirmed"], 0)
         self.assertEqual(stats["skipped_existing_filename"], 1)
@@ -853,7 +940,7 @@ class DownloadAndDryRunTests(SyncTestCase):
         world = self.make_world([111], [111])
         world.add_file(SRC, 1000, "a.pdf")
         syncer = self.make_syncer(world)
-        with mock.patch.object(syncer, "_upload_pdf", side_effect=RuntimeError("bug")):
+        with mock.patch.object(syncer, "_upload_file", side_effect=RuntimeError("bug")):
             stats = syncer.sync_attachments(apply=True)
         self.assertEqual(stats["errors"], 1)
         self.assertEqual(self.temp_files_left(), [])
@@ -936,7 +1023,7 @@ class FixRoundTests(SyncTestCase):
     def test_syncer_refuses_to_start_without_controllable_adapters(self):
         self.factory.with_session = False
         with self.assertRaises(RuntimeError):
-            AttachmentSyncer(API_KEY, SRC, TGT, SRC_COL, TGT_COL, temp_folder=self.temp_folder)
+            AttachmentSyncer(API_KEY, BLANK_ROUTE, temp_folder=self.temp_folder)
 
     # C3
     def test_listing_without_total_count_is_unknown(self):
@@ -978,7 +1065,7 @@ class FixRoundTests(SyncTestCase):
         row = Attachment({"id": 2, "name": "row.pdf", "attachmentType": "FILE",
                           "mimeType": "application/pdf", "parentType": "ROW"})
         syncer = self.make_syncer(world)
-        self.assertEqual(syncer._select_pdf_candidates(1000, [proof, row]), [row])
+        self.assertEqual(syncer._select_candidates(1000, [proof, row]), [row])
 
     # C6
     def test_filenames_that_cannot_round_trip_are_skipped(self):
@@ -1042,6 +1129,309 @@ class FixRoundTests(SyncTestCase):
         stats = self.make_syncer(world).sync_attachments(apply=True)
         self.assertEqual(stats["uploads_confirmed"], 1)
         self.assertEqual(len(world.http_get_urls), 1)
+
+
+# ------------------------------------------------------ all_files (master schedule)
+
+
+class UploadMimeTypeTests(unittest.TestCase):
+    def test_first_well_formed_candidate_wins(self):
+        self.assertEqual(upload_mime_type(XLSX_MIME, "image/png"), XLSX_MIME)
+        self.assertEqual(upload_mime_type(None, "image/png"), "image/png")
+        self.assertEqual(upload_mime_type("", " Text/Plain; charset=utf-8 "), "text/plain")
+        self.assertEqual(upload_mime_type(None, None), "application/octet-stream")
+        self.assertEqual(upload_mime_type(), "application/octet-stream")
+
+    def test_generic_values_are_skipped_until_the_fallback(self):
+        self.assertEqual(upload_mime_type("application/octet-stream", "image/png"), "image/png")
+        self.assertEqual(upload_mime_type("Binary/Octet-Stream", XLSX_MIME), XLSX_MIME)
+        self.assertEqual(upload_mime_type("binary/octet-stream", "application/octet-stream"),
+                         "application/octet-stream")
+
+    def test_malformed_values_are_never_sent(self):
+        for bad in ("text/html\r\nX-Injected: 1", 'image/"png"', "no-slash", "a b/c", "/x"):
+            with self.subTest(bad=bad):
+                self.assertEqual(upload_mime_type(bad), "application/octet-stream")
+
+
+class AllFilesRouteTests(SyncTestCase):
+    def make_world(self, source_values, target_values, **kwargs):
+        kwargs.setdefault("route", MASTER_ROUTE)
+        return super().make_world(source_values, target_values, **kwargs)
+
+    def add_mixed_files(self, world, row_id=1000):
+        world.add_file(SRC, row_id, "costs.xlsx", mime=XLSX_MIME, content=XLSX_BYTES)
+        world.add_file(SRC, row_id, "photo.png", mime="image/png", content=PNG_BYTES)
+        world.add_file(SRC, row_id, "permit.pdf")
+        world.add_file(SRC, row_id, "Drawing link", mime=None, attachment_type="LINK")
+
+    def test_spreadsheet_image_and_pdf_planned_in_dry_run(self):
+        world = self.make_world([111], [111])
+        self.add_mixed_files(world)
+        stats = self.make_syncer(world).sync_attachments(apply=False)
+        self.assertEqual(stats["files_planned"], 3)
+        self.assertEqual(stats["files_seen"], 3)   # the LINK is not a FILE
+        self.upload.Attachments.attach_file_to_row.assert_not_called()
+        self.requests_get.assert_not_called()
+        self.assertFalse(os.path.exists(self.temp_folder))
+        self.assertLessEqual(self.sdk_calls(), ALLOWED_SDK_CALLS - {"Attachments.attach_file_to_row"})
+
+    def test_spreadsheet_image_and_pdf_uploaded_with_source_mime(self):
+        world = self.make_world([111], [111])
+        self.add_mixed_files(world)
+        stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual(
+            [(u[0], u[1], u[2], u[3], u[4]) for u in world.uploads],
+            [
+                (MASTER, 5000, "costs.xlsx", XLSX_BYTES, XLSX_MIME),
+                (MASTER, 5000, "photo.png", PNG_BYTES, "image/png"),
+                (MASTER, 5000, "permit.pdf", PDF_BYTES, "application/pdf"),
+            ],
+        )
+        self.assertEqual(stats["uploads_confirmed"], 3)
+        self.assertEqual(stats["errors"], 0)
+        for key in ("non_pdf_excluded", "pdf_metadata_conflicts", "pdf_signature_rejected",
+                    "pdf_content_verified"):
+            self.assertEqual(stats[key], 0, key)
+        self.assertEqual(self.temp_files_left(), [])
+        self.assert_only_allowed_calls({5000})
+
+    def test_resolved_mime_is_preferred_over_listing_mime(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "scan.png", mime="image/png", detail_mime="image/jpeg",
+                       content=PNG_BYTES)
+        self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual([u[4] for u in world.uploads], ["image/jpeg"])
+
+    def test_upload_mime_order_skips_generic_and_malformed_values(self):
+        cases = [
+            # (listing MIME, resolved MIME, uploaded MIME)
+            ("application/octet-stream", "image/png", "image/png"),     # generic listing
+            ("binary/octet-stream", XLSX_MIME, XLSX_MIME),
+            ("image/png", "application/octet-stream", "image/png"),     # generic resolved
+            ("image/png", None, "image/png"),                           # missing resolved
+            ("image/png", "image/jpeg", "image/jpeg"),                  # both specific
+            ("binary/octet-stream", "application/octet-stream", "application/octet-stream"),
+            ("application/octet-stream", None, "application/octet-stream"),
+            (None, None, "application/octet-stream"),
+            ("image/png", "text/html\r\nX-Injected: 1", "image/png"),   # malformed resolved
+        ]
+        for listing, resolved, expected in cases:
+            with self.subTest(listing=listing, resolved=resolved):
+                world = self.make_world([111], [111])
+                world.add_file(SRC, 1000, "file", mime=listing, detail_mime=resolved,
+                               content=b"bytes")
+                stats = self.make_syncer(world).sync_attachments(apply=True)
+                self.assertEqual([u[4] for u in world.uploads], [expected])
+                self.assertEqual(stats["errors"], 0)
+                # No extra API call for the MIME choice: one get_attachment at download,
+                # plus one at selection only when the listing has no MIME type.
+                self.assertEqual(self.read.Attachments.get_attachment.call_count,
+                                 1 if listing else 2)
+
+    def test_missing_mime_is_resolved_via_get_attachment(self):
+        world = self.make_world([111], [111])
+        att = world.add_file(SRC, 1000, "scan", mime=None, detail_mime="image/png", content=PNG_BYTES)
+        syncer = self.make_syncer(world)
+        syncer.sync_attachments(apply=False)
+        self.read.Attachments.get_attachment.assert_called_with(SRC, att.id)
+        self.assertEqual(syncer.stats["files_planned"], 1)
+        self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual([(u[2], u[4]) for u in world.uploads], [("scan", "image/png")])
+
+    def test_unresolvable_but_readable_mime_falls_back_to_octet_stream(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "data.bin", mime=None, detail_mime=None, content=b"\x00\x01")
+        stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual([(u[2], u[4]) for u in world.uploads],
+                         [("data.bin", "application/octet-stream")])
+        self.assertEqual(stats["errors"], 0)
+
+    def test_failed_metadata_read_counts_error_and_skips_that_file(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "unknown", mime=None, content=b"x")
+        world.add_file(SRC, 1000, "costs.xlsx", mime=XLSX_MIME, content=XLSX_BYTES)
+        syncer = self.make_syncer(world)
+        self.read.Attachments.get_attachment.side_effect = api_error()
+        stats = syncer.sync_attachments(apply=False)
+        self.assertEqual(stats["errors"], 1)
+        self.assertEqual(stats["files_planned"], 1)
+
+    def test_pdf_name_without_signature_is_uploaded(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "error-page.pdf", content=HTML_BYTES)
+        stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual([(u[2], u[3]) for u in world.uploads], [("error-page.pdf", HTML_BYTES)])
+        self.assertEqual(stats["pdf_signature_rejected"], 0)
+        self.assertEqual(stats["errors"], 0)
+
+    def test_pdf_extension_with_non_pdf_mime_is_uploaded(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "fake.pdf", mime="image/png", content=PNG_BYTES)
+        world.add_file(SRC, 1000, "later.pdf", mime="application/pdf", detail_mime="text/html")
+        stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual([(u[2], u[4]) for u in world.uploads],
+                         [("fake.pdf", "image/png"), ("later.pdf", "text/html")])
+        self.assertEqual(stats["pdf_metadata_conflicts"], 0)
+        self.assertEqual(stats["errors"], 0)
+
+    def test_temp_file_name_never_comes_from_the_attachment_name(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "../../evil.xlsx", mime=XLSX_MIME, content=XLSX_BYTES)
+        real_mkstemp = tempfile.mkstemp
+        with mock.patch.object(attachment_sync.tempfile, "mkstemp", side_effect=real_mkstemp) as spy:
+            self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual(spy.call_count, 1)
+        kwargs = spy.call_args.kwargs
+        self.assertEqual((kwargs["prefix"], kwargs["suffix"], kwargs["dir"]),
+                         ("wr-file-", ".tmp", self.temp_folder))
+        self.assertEqual([u[2] for u in world.uploads], ["../../evil.xlsx"])
+        self.assertEqual(self.temp_files_left(), [])
+
+    def test_log_lines_name_the_route_and_never_say_pdf(self):
+        world = self.make_world([111], [111])
+        self.add_mixed_files(world)
+        with self.assertLogs("src.attachment_sync", level="DEBUG") as logs:
+            self.make_syncer(world).sync_attachments(apply=True)
+        for record in logs.records:
+            message = record.getMessage()
+            self.assertTrue(message.startswith("[master-schedule] "), message)
+            self.assertNotIn("PDF", message)
+
+    # --- shared rules still enforced on the all_files route ---------------
+
+    def test_parent_type_allowlist(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "row.xlsx", mime=XLSX_MIME, parent_type="ROW")
+        world.add_file(SRC, 1000, "discussion.png", mime="image/png", parent_type="COMMENT")
+        world.add_file(SRC, 1000, "sheet-level.xlsx", mime=XLSX_MIME, parent_type="SHEET")
+        world.add_file(SRC, 1000, "proof.png", mime="image/png", parent_type=None)
+        stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual([u[2] for u in world.uploads], ["row.xlsx", "discussion.png"])
+        self.assertEqual(stats["unsupported_parent_excluded"], 2)
+
+    def test_filename_character_skip(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, 'bad"name.xlsx', mime=XLSX_MIME)
+        world.add_file(SRC, 1000, "bad\nname.png", mime="image/png")
+        world.add_file(SRC, 1000, "good.xlsx", mime=XLSX_MIME)
+        stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual([u[2] for u in world.uploads], ["good.xlsx"])
+        self.assertEqual(stats["unsupported_filename_skipped"], 2)
+        self.assertEqual(stats["errors"], 0)
+
+    def test_existing_target_filename_is_skipped(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "costs.xlsx", mime=XLSX_MIME)
+        world.add_file(SRC, 1000, "photo.png", mime="image/png")
+        world.add_file(MASTER, 5000, "costs.xlsx", mime=XLSX_MIME)
+        stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual([u[2] for u in world.uploads], ["photo.png"])
+        self.assertEqual(stats["skipped_existing_filename"], 1)
+
+    def test_same_named_twin_is_sent_once(self):
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                world = self.make_world([111], [111])
+                world.add_file(SRC, 1000, "same.xlsx", mime=XLSX_MIME)
+                world.add_file(SRC, 1000, "same.xlsx", mime=XLSX_MIME)
+                stats = self.make_syncer(world).sync_attachments(apply=apply)
+                self.assertEqual(stats["skipped_duplicate_source_filename"], 1)
+                self.assertEqual(stats["files_planned"], 1)
+                self.assertEqual(len(world.uploads), 1 if apply else 0)
+
+    def test_post_attempted_blocks_twin_after_rejected_upload(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "same.png", mime="image/png")
+        world.add_file(SRC, 1000, "same.png", mime="image/png")
+        world.upload_effects = [(False, api_error(code=1004, message="Not authorized"))]
+        syncer = self.make_syncer(world)
+        stats = syncer.sync_attachments(apply=True)
+        self.assertEqual(self.upload.Attachments.attach_file_to_row.call_count, 1)
+        self.assertIn((5000, "same.png"), syncer._post_attempted)
+        self.assertEqual(stats["skipped_duplicate_source_filename"], 1)
+        self.assertEqual(stats["errors"], 1)
+
+    def test_content_length_mismatch_is_an_error_and_nothing_uploaded(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "big.xlsx", mime=XLSX_MIME, content=XLSX_BYTES * 50)
+        world.download_failures = ["truncate", "truncate", "truncate"]
+        stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual(world.uploads, [])
+        self.assertEqual(stats["errors"], 1)
+        self.assertEqual(self.temp_files_left(), [])
+
+    def test_unknown_target_listing_means_no_writes(self):
+        for failure in ("error", "incomplete", "no-total"):
+            with self.subTest(failure=failure):
+                world = self.make_world([111], [111])
+                world.add_file(SRC, 1000, "costs.xlsx", mime=XLSX_MIME)
+                if failure == "error":
+                    world.list_failures[(MASTER, 5000)] = [api_error()]
+                elif failure == "incomplete":
+                    world.incomplete_listing.add((MASTER, 5000))
+                else:
+                    world.missing_total.add((MASTER, 5000))
+                stats = self.make_syncer(world).sync_attachments(apply=True)
+                self.assertEqual(stats["errors"], 1)
+                self.assertEqual(world.uploads, [])
+                self.upload.Attachments.attach_file_to_row.assert_not_called()
+
+    def test_ambiguous_upload_is_relisted_once_and_not_resent(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "costs.xlsx", mime=XLSX_MIME)
+        world.add_file(SRC, 1000, "photo.png", mime="image/png")
+        world.upload_effects = [(False, ServerTimeoutExceededError(NS(result=None), "timeout"))]
+        stats = self.make_syncer(world, max_attempts=5).sync_attachments(apply=True)
+        sent = [c.args[2][0] for c in self.upload.Attachments.attach_file_to_row.call_args_list]
+        self.assertEqual(sent, ["costs.xlsx", "photo.png"])
+        target_lists = [c for c in self.read.Attachments.list_row_attachments.call_args_list
+                        if c.args[:2] == (MASTER, 5000)]
+        self.assertEqual(len(target_lists), 2)  # initial + one reconciliation
+        self.assertEqual(stats["uploads_unconfirmed"], 1)
+        self.assertEqual(stats["errors"], 1)
+
+    def test_ambiguous_upload_that_landed_is_confirmed(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "costs.xlsx", mime=XLSX_MIME)
+        world.upload_effects = [(True, UnexpectedRequestError(None, None))]
+        stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual(self.upload.Attachments.attach_file_to_row.call_count, 1)
+        self.assertEqual(stats["uploads_confirmed"], 1)
+        self.assertEqual(stats["errors"], 0)
+
+    def test_ambiguous_wr_skipped_on_master_schedule(self):
+        world = self.make_world([111, 222], [111, 111, 222])
+        world.add_file(SRC, 1000, "a.xlsx", mime=XLSX_MIME)
+        world.add_file(SRC, 1001, "b.xlsx", mime=XLSX_MIME)
+        stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual(stats["wr_ambiguous"], 1)
+        self.assertEqual([(u[1], u[2]) for u in world.uploads], [(5002, "b.xlsx")])
+        self.assert_only_allowed_calls({5002})
+
+    def test_signed_urls_never_logged(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "costs.xlsx", mime=XLSX_MIME)
+        world.add_file(SRC, 1000, "no-mime", mime=None, detail_mime="image/png")
+        world.download_failures = [403, requests.exceptions.ConnectionError(
+            f"Max retries exceeded with url: /dl?{SIGNED_MARKER}")]
+        with self.assertLogs(level="DEBUG") as logs:
+            self.make_syncer(world).sync_attachments(apply=True)
+        for record in logs.records:
+            self.assertNotIn(SIGNED_MARKER, record.getMessage())
+            self.assertNotIn(API_KEY, record.getMessage())
+
+
+class PdfOnlyRouteLabelTests(SyncTestCase):
+    def test_pdf_route_logs_name_the_route(self):
+        world = self.make_world([111], [111])
+        world.add_file(SRC, 1000, "a.pdf")
+        with self.assertLogs("src.attachment_sync", level="INFO") as logs:
+            self.make_syncer(world).sync_attachments(apply=False)
+        self.assertTrue(all(r.getMessage().startswith("[blank-copy] ") for r in logs.records))
+        text = "\n".join(r.getMessage() for r in logs.records)
+        self.assertIn("PDFs planned (new filenames): 1", text)
+        self.assertIn("PDFs content-verified", text)
 
 
 if __name__ == "__main__":

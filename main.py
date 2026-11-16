@@ -1,11 +1,15 @@
 """
 Entry point for Smartsheet Attachment Sync.
 
-Copies PDF file attachments from Project List rows to the matching existing rows
-of Project List - Blank Copy (matched by Work Request #).
+Runs the two pinned routes (src/config.py VERIFIED_ROUTES) in order, both reading
+Project List and matching existing target rows by Work Request # (the match
+column is titled "WR" on the Master Schedule):
+
+    1. master-schedule: all file attachments -> Master Schedule
+    2. blank-copy:      PDF files only       -> Project List - Blank Copy
 
     python main.py --dry-run   # plan only (default): no downloads, no uploads
-    python main.py --apply     # download, verify and upload PDFs
+    python main.py --apply     # download, verify and upload eligible files
 """
 import argparse
 import logging
@@ -18,12 +22,9 @@ load_dotenv()
 
 from src.config import (
     SMARTSHEET_API_KEY,
-    SOURCE_SHEET_ID,
-    TARGET_SHEET_ID,
-    SOURCE_MATCH_COLUMN_ID,
-    TARGET_MATCH_COLUMN_ID,
     TEMP_DOWNLOAD_FOLDER,
-    validate_routing,
+    VERIFIED_ROUTES,
+    routing_env_vars_set,
 )
 from src.attachment_sync import AttachmentSyncer, RoutingError
 
@@ -45,21 +46,26 @@ def parse_args(argv=None):
     """Parse the explicit dry-run / apply mode."""
     parser = argparse.ArgumentParser(
         description=(
-            "Copy PDF file attachments from Project List rows to the matching existing rows "
-            "of Project List - Blank Copy, matched by Work Request #. Attachment-only: "
-            "rows and cells are never written. Defaults to a dry run."
+            "Copy file attachments from Project List rows to the matching existing rows "
+            "of two target sheets, matched by Work Request #. Routes run in order: "
+            "master-schedule (all file attachments, Master Schedule), then "
+            "blank-copy (PDF files only, Project List - Blank Copy). Routing is pinned "
+            "in code. Attachment-only: rows and cells are never written. Defaults to a "
+            "dry run."
         )
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="Plan only (default): match rows and list PDF candidates; no downloads, no uploads.",
+        help="Plan only (default): match rows and list candidates on both routes; "
+             "no downloads, no uploads.",
     )
     mode.add_argument(
         "--apply",
         action="store_true",
-        help="Download, verify and upload eligible PDFs to the matching target rows.",
+        help="Download, verify and upload eligible files to the matching target rows "
+             "on both routes.",
     )
     return parser.parse_args(argv)
 
@@ -78,26 +84,23 @@ def validate_config():
     elif len(SMARTSHEET_API_KEY.strip()) < 20:
         errors.append("❌ SMARTSHEET_API_KEY appears to be invalid (too short)")
 
-    for problem in validate_routing(
-        SOURCE_SHEET_ID, TARGET_SHEET_ID, SOURCE_MATCH_COLUMN_ID, TARGET_MATCH_COLUMN_ID
-    ):
-        errors.append(f"❌ Routing: {problem}")
-
     if errors:
         logger.error("Configuration validation failed:")
         for error in errors:
             logger.error(error)
         logger.error("\nPlease set the required environment variables.")
         logger.error("For local development: see .env.example")
-        logger.error("For GitHub Actions: only SMARTSHEET_API_KEY is a secret; routing IDs are set in the workflow")
+        logger.error("For GitHub Actions: SMARTSHEET_API_KEY is the only secret; routing is pinned in code")
         return False
 
     # Log configuration (without sensitive data)
     logger.info("Configuration loaded:")
-    logger.info(f"  Source Sheet ID: {SOURCE_SHEET_ID}")
-    logger.info(f"  Target Sheet ID: {TARGET_SHEET_ID}")
-    logger.info(f"  Source Match Column ID: {SOURCE_MATCH_COLUMN_ID}")
-    logger.info(f"  Target Match Column ID: {TARGET_MATCH_COLUMN_ID}")
+    for route in VERIFIED_ROUTES:
+        logger.info(
+            f"  Route {route.name}: sheet {route.source_sheet_id} (column "
+            f"{route.source_match_column_id}) → sheet {route.target_sheet_id} (column "
+            f"{route.target_match_column_id}), file rule {route.file_rule}"
+        )
     logger.info(f"  Temp Download Folder: {TEMP_DOWNLOAD_FOLDER}")
     logger.info(f"  API Key: {'*' * 20} (hidden)")
 
@@ -108,9 +111,12 @@ def main(argv=None) -> int:
     """
     Main entry point for the attachment sync application.
 
+    Runs every route in VERIFIED_ROUTES in order. A failure in one route is
+    logged and counted, and the next route still runs.
+
     Returns:
-        Process exit status: 0 when no unresolved errors, 1 otherwise,
-        130 when interrupted.
+        Process exit status: 0 when every route finished with no unresolved
+        errors, 1 otherwise, 130 when interrupted.
     """
     args = parse_args(argv)
     apply = bool(args.apply)
@@ -124,48 +130,68 @@ def main(argv=None) -> int:
 
     logger.info("🚀 Smartsheet Attachment Sync - Starting")
     if apply:
-        logger.info("Mode: APPLY (eligible PDFs will be uploaded to the target sheet)")
+        logger.info("Mode: APPLY (eligible files will be uploaded to the target sheets)")
     elif args.dry_run:
         logger.info("Mode: DRY RUN (no downloads, no uploads)")
     else:
         logger.info("Mode: DRY RUN (default - no mode flag given; use --apply to upload)")
+
+    ignored = routing_env_vars_set()
+    if ignored:
+        logger.warning(
+            f"⚠️ Ignoring routing environment variables {', '.join(ignored)}: "
+            f"routing is pinned in code (src/config.py VERIFIED_ROUTES)"
+        )
 
     # Validate configuration
     if not validate_config():
         logger.error("❌ Exiting due to configuration errors")
         return 1
 
-    try:
-        syncer = AttachmentSyncer(
-            api_key=SMARTSHEET_API_KEY,
-            source_sheet_id=SOURCE_SHEET_ID,
-            target_sheet_id=TARGET_SHEET_ID,
-            source_match_column_id=SOURCE_MATCH_COLUMN_ID,
-            target_match_column_id=TARGET_MATCH_COLUMN_ID,
-            temp_folder=TEMP_DOWNLOAD_FOLDER
-        )
+    results = []  # (route name, ok, outcome)
+    for route in VERIFIED_ROUTES:
+        try:
+            syncer = AttachmentSyncer(
+                api_key=SMARTSHEET_API_KEY,
+                route=route,
+                temp_folder=TEMP_DOWNLOAD_FOLDER,
+            )
+            stats = syncer.sync_attachments(apply=apply)
+        except KeyboardInterrupt:
+            logger.info("\n⚠️ Sync interrupted by user")
+            return 130
+        except RoutingError as e:
+            logger.error(f"❌ [{route.name}] Routing check failed, nothing was written for this route: {e}")
+            results.append((route.name, False, "routing check failed"))
+            continue
+        except Exception as e:
+            logger.error(f"❌ [{route.name}] Fatal error: {e}", exc_info=True)
+            results.append((route.name, False, f"fatal error ({type(e).__name__})"))
+            continue
 
-        # Run sync
-        stats = syncer.sync_attachments(apply=apply)
+        # Expected skips (invalid placeholders, unmatched WRs, existing filenames)
+        # are not errors; anything counted here is an unresolved operational error.
+        errors = stats.get("errors", 0)
+        if errors == 0:
+            results.append((route.name, True, "completed with no errors"))
+        else:
+            results.append((route.name, False, f"{errors} unresolved error(s)"))
 
-    except KeyboardInterrupt:
-        logger.info("\n⚠️ Sync interrupted by user")
-        return 130
-    except RoutingError as e:
-        logger.error(f"❌ Routing check failed, nothing was written: {e}")
-        return 1
-    except Exception as e:
-        logger.error(f"❌ Fatal error: {e}", exc_info=True)
-        return 1
+    logger.info("=" * 60)
+    for name, ok, outcome in results:
+        if ok:
+            logger.info(f"✅ Route {name}: {outcome}")
+        else:
+            logger.error(f"❌ Route {name}: {outcome}")
 
-    errors = stats.get("errors", 0)
-    if errors == 0:
-        logger.info("✅ Sync completed with no errors")
+    failed = sum(1 for _, ok, _ in results if not ok)
+    if failed == 0:
+        logger.info(f"✅ All {len(results)} routes completed with no errors")
         return 0
 
-    # Expected skips (invalid placeholders, unmatched WRs, existing filenames)
-    # are not errors; anything counted here is an unresolved operational error.
-    logger.error(f"❌ Sync finished with {errors} unresolved error(s) - exiting with status 1")
+    logger.error(
+        f"❌ {failed} of {len(results)} route(s) failed or had errors - exiting with status 1"
+    )
     return 1
 
 

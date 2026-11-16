@@ -88,8 +88,9 @@ Edit `.env` with your actual values:
 
 ```
 SMARTSHEET_API_KEY=your_api_key_here
-TEMP_DOWNLOAD_FOLDER=/tmp/smartsheet-attachments
 ```
+
+Downloads go to a fixed folder under the system temp directory (`<system temp>/smartsheet-attachments`, i.e. `/tmp/smartsheet-attachments` on the Actions runner); it is not configurable from the environment.
 
 There are no routing variables. Routing is pinned in code (`src/config.py`, `VERIFIED_ROUTES`); `SOURCE_SHEET_ID`, `TARGET_SHEET_ID`, `SOURCE_MATCH_COLUMN_ID` and `TARGET_MATCH_COLUMN_ID` are ignored if set, and the job logs one warning naming them. Retargeting is a reviewed code change, not a config override.
 
@@ -136,7 +137,7 @@ Only one run at a time can work on the targets: scheduled and manual runs share 
 
 The steps below run once per route (Master Schedule first, then Blank Copy). Every log line of a route is prefixed with the route name, e.g. `[master-schedule]`.
 
-1. **Load and verify sheets** - Loads the source and the route's target sheet and checks, before any write, that each sheet ID is the pinned one, that the pinned match column exists and carries exactly the title pinned for that sheet in that route (`Work Request #`, or `WR` on the Master Schedule), and that every row was loaded. Any mismatch stops that route (nothing written to it), the other route still runs, and the exit status is 1.
+1. **Load and verify sheets** - Loads the source and the route's target sheet and checks, before any write, that each sheet ID is the pinned one, that the pinned match column exists and carries exactly the title pinned for that sheet in that route (`Work Request #`, or `WR` on the Master Schedule), and that every row was loaded: the response must carry an integer total row count equal to the rows received. If the first response holds fewer rows than that total, the remaining pages are fetched with explicit paging and combined; the combined rows must match the total exactly with no repeated row IDs. Any mismatch stops that route (nothing written to it), the other route still runs, and the exit status is 1.
 2. **Index Work Request #** - Builds an exact key for each row (see matching rules).
 3. **Match** - For each valid source WR: skip it if it appears more than once in either sheet (ambiguous, row IDs reported), skip it if the target has no such row (rows are never created), otherwise pair the source row with the target row ID returned by the API.
 4. **Plan files** - Lists each matched source row's FILE attachments and keeps the candidates allowed by the route's file rule.
@@ -223,7 +224,8 @@ sync-master-schedule/
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `SMARTSHEET_API_KEY` | string | Required | Smartsheet API key |
-| `TEMP_DOWNLOAD_FOLDER` | string | /tmp/smartsheet-attachments | Temporary download location (created only with `--apply`) |
+
+The download temp folder is fixed under the system temp directory (`<system temp>/smartsheet-attachments`, created only with `--apply`); `TEMP_DOWNLOAD_FOLDER` is no longer read.
 
 Routing is pinned in `src/config.py` (`VERIFIED_ROUTES`, see [Routes](#routes)) and is not read from the environment. `SOURCE_SHEET_ID`, `TARGET_SHEET_ID`, `SOURCE_MATCH_COLUMN_ID` and `TARGET_MATCH_COLUMN_ID` are ignored if set (one warning is logged). The syncer refuses any route that is not exactly one of the verified routes: an unknown target, the same sheet for source and target, the wrong file rule for a target, a mismatched column, or a non-integer ID.
 
@@ -294,7 +296,7 @@ Illustrative output of an `--apply` run (counts and IDs are examples):
 2026-11-17 05:01:10 - INFO - ✅ All 2 routes completed with no errors
 ```
 
-Each route's summary lists every counter: source/target rows, blank and invalid WRs, matched/unmatched/ambiguous WRs, FILE attachments seen, files excluded for an unsupported parent (sheet-level, proof), files skipped for unsupported filename characters, planned files, existing and duplicate filenames, confirmed, unconfirmed and unresolved uploads, uploads stored under a different name, and errors. The Blank Copy summary also lists non-PDF exclusions, metadata conflicts, content-verified PDFs and signature rejections. Unconfirmed, unresolved and name-mismatch uploads all count as errors. In a dry run, "planned" files are metadata candidates only; nothing is downloaded, so "content-verified" stays 0.
+Each route's summary lists every counter: source/target rows, blank and invalid WRs, matched/unmatched/ambiguous WRs, WRs duplicated in the target only (no source row; warned with their row IDs, not an error), FILE attachments seen, files excluded for an unsupported parent (sheet-level, proof), files skipped for unsupported filename characters, planned files, existing and duplicate filenames, confirmed, unconfirmed and unresolved uploads, uploads stored under a different name, and errors. The Blank Copy summary also lists non-PDF exclusions, metadata conflicts, content-verified PDFs and signature rejections. Unconfirmed, unresolved and name-mismatch uploads all count as errors. In a dry run, "planned" files are metadata candidates only; nothing is downloaded, so "content-verified" stays 0.
 
 ## Troubleshooting
 

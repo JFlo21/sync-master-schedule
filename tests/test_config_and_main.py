@@ -5,6 +5,9 @@ import dataclasses
 import importlib
 import logging
 import os
+import subprocess
+import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -18,6 +21,7 @@ MASTER_COL = 1437881091182468
 BLANK = 573385022328708
 BLANK_COL = 7068369005875076
 GOOD_KEY = "test-key-not-real-0123456789"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 WR_TITLE = "Work Request #"
 MASTER_ROUTE = Route("master-schedule", SRC, MASTER, SRC_COL, MASTER_COL, FILE_RULE_ALL, WR_TITLE, "WR")
@@ -119,6 +123,23 @@ class RoutingConfigTests(unittest.TestCase):
         self.assertTrue(config.validate_route(
             ("blank-copy", SRC, BLANK, SRC_COL, BLANK_COL, "pdf_only", WR_TITLE, WR_TITLE)))
 
+    def test_temp_folder_is_fixed_and_ignores_the_environment(self):
+        # BUG D: a fresh interpreter (config is not reloaded in-process, which would
+        # replace the Route class other modules hold) with the variable set.
+        fixed = os.path.join(tempfile.gettempdir(), "smartsheet-attachments")
+        self.assertEqual(config.TEMP_DOWNLOAD_FOLDER, fixed)
+        self.assertIs(main.TEMP_DOWNLOAD_FOLDER, config.TEMP_DOWNLOAD_FOLDER)
+        env_value = os.path.join(tempfile.gettempdir(), "elsewhere-from-env")
+        env = dict(os.environ, TEMP_DOWNLOAD_FOLDER=env_value)
+        script = ("import os, tempfile; from src import config; "
+                  "print(config.TEMP_DOWNLOAD_FOLDER); "
+                  "print(os.path.join(tempfile.gettempdir(), 'smartsheet-attachments'))")
+        result = subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT, env=env,
+                                capture_output=True, text=True, timeout=60, check=True)
+        used, expected = result.stdout.splitlines()
+        self.assertEqual(used, expected)
+        self.assertNotEqual(used, env_value)
+
     def test_routing_env_vars_set_reports_only_non_blank_names(self):
         env = {"SOURCE_SHEET_ID": "1", "TARGET_SHEET_ID": "  ", "TARGET_MATCH_COLUMN_ID": "2",
                "SMARTSHEET_API_KEY": "x"}
@@ -145,8 +166,11 @@ class MainTests(unittest.TestCase):
         self.init_errors = {}
         self.order = []
 
+        self.temp_folders = []
+
         def build(api_key, route, temp_folder):
             self.order.append(route)
+            self.temp_folders.append(temp_folder)
             if route.name in self.init_errors:
                 raise self.init_errors[route.name]
             syncer = mock.MagicMock(name=f"syncer-{route.name}")
@@ -222,6 +246,12 @@ class MainTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         for name in ROUTING_VARS:
             self.assertIn(name, warnings[0].getMessage())
+
+    def test_syncers_receive_the_fixed_temp_folder_not_the_env_value(self):
+        os.environ["TEMP_DOWNLOAD_FOLDER"] = os.path.join(tempfile.gettempdir(), "elsewhere-from-env")
+        self.assertEqual(self.run_main(["--apply"])[0], 0)
+        fixed = os.path.join(tempfile.gettempdir(), "smartsheet-attachments")
+        self.assertEqual(self.temp_folders, [fixed, fixed])
 
     def test_no_warning_without_routing_env_vars(self):
         _, text = self.run_main([])

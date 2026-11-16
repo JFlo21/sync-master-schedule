@@ -7,6 +7,7 @@ of each target) is pinned in code as VERIFIED_ROUTES. It is not read from the
 environment: retargeting is a reviewed code change, not a config override.
 """
 import os
+import tempfile
 from dataclasses import dataclass, fields
 from typing import Any, List, Mapping, Optional
 
@@ -80,8 +81,10 @@ _ID_FIELDS = (
 # API Key (must be set via environment variable)
 SMARTSHEET_API_KEY = os.getenv("SMARTSHEET_API_KEY")
 
-# Temp folder for attachment downloads
-TEMP_DOWNLOAD_FOLDER = os.getenv("TEMP_DOWNLOAD_FOLDER", "/tmp/smartsheet-attachments")
+# Temp folder for attachment downloads. Fixed under the system temp directory and
+# deliberately not configurable from the environment (no env value may become a
+# filesystem path). On the Actions runner this is /tmp/smartsheet-attachments.
+TEMP_DOWNLOAD_FOLDER = os.path.join(tempfile.gettempdir(), "smartsheet-attachments")
 
 
 def routing_env_vars_set(environ: Optional[Mapping[str, str]] = None) -> List[str]:

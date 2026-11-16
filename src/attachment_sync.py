@@ -28,7 +28,13 @@ from smartsheet.exceptions import (
 )
 from urllib3.util.retry import Retry
 
-from .config import FILE_RULE_PDF_ONLY, KNOWN_FILE_RULES, Route, validate_route
+from .config import (
+    FILE_RULE_PDF_ONLY,
+    KNOWN_FILE_RULES,
+    TEMP_DOWNLOAD_FOLDER,
+    Route,
+    validate_route,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -255,7 +261,7 @@ class AttachmentSyncer:
         self,
         api_key: str,
         route: Route,
-        temp_folder: str = "/tmp/smartsheet-attachments",
+        temp_folder: Optional[str] = None,
         max_attempts: int = 3,
         retry_delay: float = 2.0,
         upload_min_interval: float = 2.5,
@@ -268,7 +274,8 @@ class AttachmentSyncer:
             api_key: Smartsheet API key
             route: One of config.VERIFIED_ROUTES (sheet/column IDs and file rule);
                 anything else raises RoutingError before any client is built
-            temp_folder: Temporary folder for downloads (created only in apply mode)
+            temp_folder: Temporary folder for downloads (created only in apply mode);
+                None = config.TEMP_DOWNLOAD_FOLDER (fixed, never from the environment)
             max_attempts: Maximum attempts for reads, downloads and upload POSTs
             retry_delay: Initial delay in seconds between retries (doubles each retry)
             upload_min_interval: Minimum seconds between upload POST starts
@@ -308,7 +315,7 @@ class AttachmentSyncer:
         self.upload_client.errors_as_exceptions(True)
         disable_transport_retries(self.upload_client)
 
-        self.temp_folder = temp_folder
+        self.temp_folder = TEMP_DOWNLOAD_FOLDER if temp_folder is None else temp_folder
         self.max_attempts = max(1, int(max_attempts))
         self.retry_delay = retry_delay
         self.upload_min_interval = upload_min_interval
@@ -328,6 +335,7 @@ class AttachmentSyncer:
             "wr_matched": 0,
             "wr_unmatched": 0,
             "wr_ambiguous": 0,
+            "wr_target_only_duplicates": 0,
             "files_seen": 0,
             "unsupported_parent_excluded": 0,
             "non_pdf_excluded": 0,
@@ -907,12 +915,68 @@ class AttachmentSyncer:
 
     # ------------------------------------------------------------------ sync
 
+    def _load_sheet_rows(self, sheet_id: int, label: str) -> Tuple[Any, List[Any]]:
+        """
+        Load a sheet and all of its rows.
+
+        Normally the first (un-paged) response holds every row and this is the
+        only call. If it holds fewer rows than its integer total_row_count (and
+        at least one row), the remaining pages are fetched with explicit paging
+        (page size = rows in the first response) and combined in order. A page
+        with no rows stops the loop; preflight then fails the row count.
+
+        Returns (first response, combined rows). Column/ID/title preflight uses
+        the first response.
+
+        Raises:
+            RoutingError: the combined pages contain duplicate row IDs.
+        """
+        sheet = self._retry_read(self.client.Sheets.get_sheet, f"Load {label} sheet", sheet_id)
+        rows = list(getattr(sheet, "rows", None) or [])
+        total = getattr(sheet, "total_row_count", None)
+        if not isinstance(total, int) or isinstance(total, bool) or not rows or total <= len(rows):
+            return sheet, rows
+
+        page_size = len(rows)
+        last_page = math.ceil(total / page_size)
+        self._log.info(
+            f"📄 {label.capitalize()} sheet {sheet_id}: first response holds {page_size} of {total} "
+            f"rows; loading pages 2-{last_page} ({page_size} rows per page)"
+        )
+        for page in range(2, last_page + 1):
+            response = self._retry_read(
+                self.client.Sheets.get_sheet,
+                f"Load {label} sheet page {page}/{last_page}",
+                sheet_id,
+                page_size=page_size,
+                page=page,
+            )
+            page_rows = list(getattr(response, "rows", None) or [])
+            if not page_rows:
+                self._log.warning(
+                    f"⚠️ {label.capitalize()} sheet {sheet_id} page {page} returned no rows; "
+                    f"stopping paging"
+                )
+                break
+            rows.extend(page_rows)
+
+        row_ids = [row.id for row in rows]
+        if len(set(row_ids)) != len(row_ids):
+            raise RoutingError(
+                f"route {self.route.name!r}: {label} sheet {sheet_id} pages contain duplicate row "
+                f"IDs ({len(row_ids) - len(set(row_ids))} repeated); the rows cannot be trusted"
+            )
+        return sheet, rows
+
     def _preflight_sheet(
-        self, sheet: Any, expected_sheet_id: int, match_column_id: int, expected_title: str, label: str
+        self, sheet: Any, rows: List[Any], expected_sheet_id: int, match_column_id: int,
+        expected_title: str, label: str,
     ) -> None:
         """
-        Fail before any write if the loaded sheet is not the verified one, or its
-        match column is missing or not titled exactly as pinned for this route.
+        Fail before any write if the loaded sheet is not the verified one, its
+        match column is missing or not titled exactly as pinned for this route,
+        or the loaded rows cannot be proven complete against an integer
+        total_row_count.
         """
         route = f"route {self.route.name!r}"
         actual_id = _as_int(getattr(sheet, "id", None))
@@ -932,9 +996,14 @@ class AttachmentSyncer:
                 f"{route}: {label} match column {match_column_id} is titled {title!r}, "
                 f"expected {expected_title!r}"
             )
-        rows = getattr(sheet, "rows", None) or []
         total = getattr(sheet, "total_row_count", None)
-        if isinstance(total, int) and not isinstance(total, bool) and total != len(rows):
+        if not isinstance(total, int) or isinstance(total, bool):
+            # Same rule as attachment listings: without a total, unknown is not complete.
+            raise RoutingError(
+                f"{route}: {label} sheet {expected_sheet_id} response has no total row count "
+                f"(got {total!r}); completeness cannot be confirmed"
+            )
+        if total != len(rows):
             raise RoutingError(
                 f"{route}: {label} sheet {expected_sheet_id} loaded incompletely: "
                 f"{len(rows)} of {total} rows"
@@ -995,26 +1064,20 @@ class AttachmentSyncer:
         try:
             # Load sheets
             self._log.info(f"📋 Loading source sheet: {self.source_sheet_id}")
-            source_sheet = self._retry_read(
-                self.client.Sheets.get_sheet, "Load source sheet", self.source_sheet_id
-            )
+            source_sheet, source_rows = self._load_sheet_rows(self.source_sheet_id, "source")
             self._log.info(f"📋 Loading target sheet: {self.target_sheet_id}")
-            target_sheet = self._retry_read(
-                self.client.Sheets.get_sheet, "Load target sheet", self.target_sheet_id
-            )
+            target_sheet, target_rows = self._load_sheet_rows(self.target_sheet_id, "target")
 
             # Destination checks before any write
             self._preflight_sheet(
-                source_sheet, self.source_sheet_id, self.source_match_column_id,
+                source_sheet, source_rows, self.source_sheet_id, self.source_match_column_id,
                 self.route.source_match_column_title, "source",
             )
             self._preflight_sheet(
-                target_sheet, self.target_sheet_id, self.target_match_column_id,
+                target_sheet, target_rows, self.target_sheet_id, self.target_match_column_id,
                 self.route.target_match_column_title, "target",
             )
 
-            source_rows = list(source_sheet.rows or [])
-            target_rows = list(target_sheet.rows or [])
             self.stats["source_rows_total"] = len(source_rows)
             self.stats["target_rows_total"] = len(target_rows)
 
@@ -1066,6 +1129,15 @@ class AttachmentSyncer:
                 self.stats["wr_matched"] += 1
                 pairs.append((key, source_row_ids[0], target_row_ids[0]))
 
+            # A WR repeated in the target with no source row is never visited above.
+            for key, target_row_ids in target_index.items():
+                if len(target_row_ids) > 1 and key not in source_index:
+                    self.stats["wr_target_only_duplicates"] += 1
+                    self._log.warning(
+                        f"⚠️ Duplicate WR {key} in target only: target rows {target_row_ids}, "
+                        f"no source row; nothing to copy"
+                    )
+
             self._log.info(
                 f"🔗 WRs matched: {self.stats['wr_matched']}, unmatched: {self.stats['wr_unmatched']}, "
                 f"ambiguous: {self.stats['wr_ambiguous']}"
@@ -1109,6 +1181,7 @@ class AttachmentSyncer:
         self._log.info(f"WRs matched: {s['wr_matched']}")
         self._log.info(f"WRs unmatched (no target row): {s['wr_unmatched']}")
         self._log.info(f"WRs ambiguous (skipped): {s['wr_ambiguous']}")
+        self._log.info(f"WRs duplicated in target only (no source row): {s['wr_target_only_duplicates']}")
         self._log.info(f"FILE attachments seen: {s['files_seen']}")
         self._log.info(f"Excluded (not a row/discussion attachment): {s['unsupported_parent_excluded']}")
         nouns = _upper_first(self._nouns)

@@ -158,6 +158,10 @@ class FakeWorld:
         self.upload_effects = []
         self.download_failures = []
         self.http_get_urls = []
+        # Sheet paging: sheet_id -> rows served by an un-paged first request (None = all)
+        self.served_page_size = {}
+        self.page_failures = {}   # (sheet_id, page) -> exception
+        self.page_rows = {}       # (sheet_id, page) -> rows override for that page
         self._next_id = 90000
         self._url_counter = 0
 
@@ -178,8 +182,21 @@ class FakeWorld:
         return att
 
     # --- SDK fakes -------------------------------------------------------
-    def get_sheet(self, sheet_id):
-        return self.sheets[sheet_id]
+    def get_sheet(self, sheet_id, page_size=None, page=None):
+        sheet = self.sheets[sheet_id]
+        served = self.served_page_size.get(sheet_id)
+        if page is None and served is None:
+            return sheet                      # whole sheet in one response (today's behaviour)
+        if page is None:
+            page, page_size = 1, served       # un-paged request, server default page size
+        if (sheet_id, page) in self.page_failures:
+            raise self.page_failures[(sheet_id, page)]
+        rows = self.page_rows.get((sheet_id, page))
+        if rows is None:
+            start = (page - 1) * page_size
+            rows = sheet.rows[start:start + page_size]
+        return NS(id=sheet.id, columns=sheet.columns, rows=list(rows),
+                  total_row_count=sheet.total_row_count)
 
     def list_row_attachments(self, sheet_id, row_id, include_all=None):
         key = (sheet_id, row_id)
@@ -444,6 +461,13 @@ class ConstructionTests(SyncTestCase):
                 )
         self.assertEqual(len(self.factory.created), 4)  # read + upload client per route
 
+    # BUG D: the temp folder never comes from the environment
+    def test_default_temp_folder_is_the_fixed_config_path(self):
+        fixed = os.path.join(tempfile.gettempdir(), "smartsheet-attachments")
+        with mock.patch.dict(os.environ, {"TEMP_DOWNLOAD_FOLDER": os.path.join(self.temp_folder, "env")}):
+            syncer = AttachmentSyncer(API_KEY, BLANK_ROUTE)
+        self.assertEqual(syncer.temp_folder, fixed)
+
     def test_temp_folder_not_created_at_init(self):
         self.make_syncer(self.make_world([], []))
         self.assertFalse(os.path.exists(self.temp_folder))
@@ -482,6 +506,32 @@ class PreflightTests(SyncTestCase):
         world.sheets[SRC].total_row_count = 5
         self.run_expecting_routing_error(world)
 
+    # BUG A: an unknown total row count must fail closed, like attachment listings
+    def test_missing_total_row_count_fails_closed(self):
+        for side, sheet_id in (("source", SRC), ("target", TGT)):
+            for total in (None, "missing", True, "1", 1.0):
+                with self.subTest(side=side, total=total):
+                    world = self.make_world(["1"], ["1"])
+                    world.add_file(SRC, 1000, "a.pdf")
+                    if total == "missing":
+                        del world.sheets[sheet_id].total_row_count
+                    else:
+                        world.sheets[sheet_id].total_row_count = total
+                    syncer = self.make_syncer(world)
+                    with self.assertRaises(RoutingError) as ctx:
+                        syncer.sync_attachments(apply=True)
+                    message = str(ctx.exception)
+                    for part in ("blank-copy", side, str(sheet_id), "total row count"):
+                        self.assertIn(part, message)
+                    self.read.Attachments.list_row_attachments.assert_not_called()
+                    self.upload.Attachments.attach_file_to_row.assert_not_called()
+
+    def test_integer_total_matching_rows_still_passes(self):
+        for source, target in (([], []), (["1"], ["1"]), ([111, 222], [222])):
+            with self.subTest(source=source, target=target):
+                stats = self.make_syncer(self.make_world(source, target)).sync_attachments(apply=False)
+                self.assertEqual(stats["errors"], 0)
+
     def test_blank_copy_requires_work_request_title_on_both_sides(self):
         for kwargs in ({"target_title": "WR"}, {"source_title": "WR"}):
             with self.subTest(**kwargs):
@@ -515,6 +565,83 @@ class PreflightTests(SyncTestCase):
                     self.assertIn(part, message)
                 self.upload.Attachments.attach_file_to_row.assert_not_called()
                 self.read.Attachments.list_row_attachments.assert_not_called()
+
+
+# --------------------------------------------------------------- sheet paging
+
+
+class SheetPagingTests(SyncTestCase):
+    """BUG B: a first get_sheet response with fewer rows than total_row_count."""
+
+    def paged_world(self, n=250, served=100):
+        values = list(range(1, n + 1))
+        world = self.make_world(values, values)
+        world.served_page_size[SRC] = served
+        return world
+
+    def sheet_calls(self, sheet_id):
+        return [c for c in self.read.Sheets.get_sheet.call_args_list if c.args[0] == sheet_id]
+
+    def run_expecting_routing_error(self, world):
+        syncer = self.make_syncer(world)
+        with self.assertRaises(RoutingError) as ctx:
+            syncer.sync_attachments(apply=True)
+        self.read.Attachments.list_row_attachments.assert_not_called()
+        self.upload.Attachments.attach_file_to_row.assert_not_called()
+        return str(ctx.exception)
+
+    def test_remaining_pages_are_fetched_and_combined_in_order(self):
+        world = self.paged_world()
+        world.add_file(SRC, 1249, "last-page.pdf")   # row 250, served on page 3
+        stats = self.make_syncer(world).sync_attachments(apply=True)
+        self.assertEqual(self.sheet_calls(SRC), [
+            mock.call(SRC),
+            mock.call(SRC, page_size=100, page=2),
+            mock.call(SRC, page_size=100, page=3),
+        ])
+        self.assertEqual(self.sheet_calls(TGT), [mock.call(TGT)])
+        self.assertEqual(stats["source_rows_total"], 250)
+        self.assertEqual(stats["wr_matched"], 250)
+        self.assertEqual(stats["errors"], 0)
+        self.assertEqual([(u[1], u[2]) for u in world.uploads], [(5249, "last-page.pdf")])
+
+    def test_complete_first_response_makes_exactly_one_call_per_sheet(self):
+        world = self.make_world([111, 222], [111, 222])
+        self.make_syncer(world).sync_attachments(apply=False)
+        self.assertEqual(self.read.Sheets.get_sheet.call_args_list, [mock.call(SRC), mock.call(TGT)])
+
+    def test_failed_later_page_fails_the_route_without_writes(self):
+        world = self.paged_world()
+        world.add_file(SRC, 1000, "a.pdf")
+        world.page_failures[(SRC, 3)] = api_error()
+        syncer = self.make_syncer(world)
+        with self.assertRaises(ApiError):
+            syncer.sync_attachments(apply=True)
+        self.assertGreaterEqual(syncer.stats["errors"], 1)
+        self.read.Attachments.list_row_attachments.assert_not_called()
+        self.upload.Attachments.attach_file_to_row.assert_not_called()
+
+    def test_overlapping_pages_fail_closed(self):
+        world = self.paged_world()
+        world.page_rows[(SRC, 2)] = world.sheets[SRC].rows[50:150]   # 250 rows, 50 repeated
+        self.assertIn("duplicate row", self.run_expecting_routing_error(world))
+
+    def test_combined_count_mismatch_fails_closed(self):
+        world = self.paged_world()
+        world.page_rows[(SRC, 3)] = world.sheets[SRC].rows[200:240]  # rows removed meanwhile
+        self.assertIn("240 of 250", self.run_expecting_routing_error(world))
+
+    def test_empty_later_page_stops_paging_and_fails_closed(self):
+        world = self.paged_world()
+        world.page_rows[(SRC, 2)] = []
+        self.assertIn("100 of 250", self.run_expecting_routing_error(world))
+        self.assertEqual(len(self.sheet_calls(SRC)), 2)   # page 3 never requested
+
+    def test_zero_rows_with_positive_total_fails_closed_without_paging(self):
+        world = self.make_world([111], [111])
+        world.sheets[SRC].rows = []
+        self.assertIn("0 of 1", self.run_expecting_routing_error(world))
+        self.assertEqual(self.sheet_calls(SRC), [mock.call(SRC)])
 
 
 # ------------------------------------------------------------------- matching
@@ -558,6 +685,30 @@ class MatchingTests(SyncTestCase):
         self.assertIn("[5001, 5002]", text)   # target rows for WR 222
         self.assertEqual([u[1] for u in world.uploads], [5003])
         self.assert_only_allowed_calls({5003})
+
+    # BUG C: a WR duplicated only in the target sheet must be reported
+    def test_target_only_duplicate_wr_is_reported(self):
+        world = self.make_world([111], [111, 222, 222, "333", 333.0])
+        world.add_file(SRC, 1000, "a.pdf")
+        syncer = self.make_syncer(world)
+        with self.assertLogs("src.attachment_sync", level="INFO") as logs:
+            stats = syncer.sync_attachments(apply=True)
+        self.assertEqual(stats["wr_target_only_duplicates"], 2)
+        self.assertEqual((stats["wr_matched"], stats["wr_unmatched"], stats["wr_ambiguous"]), (1, 0, 0))
+        self.assertEqual([u[1] for u in world.uploads], [5000])
+        warnings = [r.getMessage() for r in logs.records if r.levelno == logging.WARNING]
+        self.assertTrue(any("WR 222" in w and "[5001, 5002]" in w for w in warnings), warnings)
+        self.assertTrue(any("WR 333" in w and "[5003, 5004]" in w for w in warnings), warnings)
+        self.assertIn("[blank-copy] WRs duplicated in target only (no source row): 2",
+                      "\n".join(r.getMessage() for r in logs.records))
+
+    def test_duplicate_also_in_source_is_counted_as_ambiguous_only(self):
+        # 111 duplicated in target with a source row; 222 duplicated in source only
+        world = self.make_world([111, 222, 222, 444], [111, 111, 222, 333])
+        stats = self.make_syncer(world).sync_attachments(apply=False)
+        self.assertEqual(stats["wr_ambiguous"], 2)
+        self.assertEqual(stats["wr_target_only_duplicates"], 0)
+        self.assertEqual((stats["wr_matched"], stats["wr_unmatched"]), (0, 1))
 
     def test_unmatched_wr_is_skipped_without_creating_rows(self):
         world = self.make_world([111, 444], [111])

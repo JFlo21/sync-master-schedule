@@ -18,6 +18,9 @@ on:
     paths-ignore:
       - "website/docs/runbook/whats-new.md"
 
+# This workflow never uses GITHUB_TOKEN; give it no permissions.
+permissions: {}
+
 jobs:
   notify:
     runs-on: ubuntu-latest

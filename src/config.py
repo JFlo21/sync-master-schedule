@@ -81,9 +81,10 @@ _ID_FIELDS = (
 # API Key (must be set via environment variable)
 SMARTSHEET_API_KEY = os.getenv("SMARTSHEET_API_KEY")
 
-# Temp folder for attachment downloads. Fixed under the system temp directory and
-# deliberately not configurable from the environment (no env value may become a
-# filesystem path). On the Actions runner this is /tmp/smartsheet-attachments.
+# Temp folder for attachment downloads: a fixed name under the system temp directory.
+# It has no setting of its own (TEMP_DOWNLOAD_FOLDER is no longer read). The system
+# temp directory itself still follows the OS variables TMPDIR/TEMP/TMP. On the Actions
+# runner this is /tmp/smartsheet-attachments.
 TEMP_DOWNLOAD_FOLDER = os.path.join(tempfile.gettempdir(), "smartsheet-attachments")
 
 

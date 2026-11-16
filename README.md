@@ -90,7 +90,7 @@ Edit `.env` with your actual values:
 SMARTSHEET_API_KEY=your_api_key_here
 ```
 
-Downloads go to a fixed folder under the system temp directory (`<system temp>/smartsheet-attachments`, i.e. `/tmp/smartsheet-attachments` on the Actions runner); it is not configurable from the environment.
+Downloads go to a fixed folder under the system temp directory (`<system temp>/smartsheet-attachments`, i.e. `/tmp/smartsheet-attachments` on the Actions runner). It has no setting of its own; the system temp directory itself still follows the OS variables `TMPDIR`/`TEMP`/`TMP`.
 
 There are no routing variables. Routing is pinned in code (`src/config.py`, `VERIFIED_ROUTES`); `SOURCE_SHEET_ID`, `TARGET_SHEET_ID`, `SOURCE_MATCH_COLUMN_ID` and `TARGET_MATCH_COLUMN_ID` are ignored if set, and the job logs one warning naming them. Retargeting is a reviewed code change, not a config override.
 

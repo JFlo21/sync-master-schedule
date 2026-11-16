@@ -2,8 +2,22 @@ name: Smartsheet Attachment Sync
 
 on:
   schedule:
-    - cron: '0 5 * * *'  # Daily at 5:00 AM UTC
-  workflow_dispatch:      # Manual trigger
+    - cron: '0 5 * * *'  # Daily at 5:00 AM UTC (runs with --apply)
+  workflow_dispatch:      # Manual trigger (defaults to dry run)
+    inputs:
+      mode:
+        description: 'dry-run = plan only (no downloads/uploads); apply = copy attachments to both target sheets'
+        type: choice
+        options:
+          - dry-run
+          - apply
+        default: dry-run
+
+# One sync at a time (it writes to both target sheets). A new run waits; an active
+# run is never cancelled mid-upload.
+concurrency:
+  group: smartsheet-attachment-sync
+  cancel-in-progress: false
 
 jobs:
   sync-attachments:
@@ -21,11 +35,16 @@ jobs:
       - name: Run Attachment Sync
         env:
           SMARTSHEET_API_KEY: ${{ secrets.SMARTSHEET_API_KEY }}
-          SOURCE_SHEET_ID: ${{ secrets.SOURCE_SHEET_ID }}
-          TARGET_SHEET_ID: ${{ secrets.TARGET_SHEET_ID }}
-          SOURCE_MATCH_COLUMN_ID: ${{ secrets.SOURCE_MATCH_COLUMN_ID }}
-          TARGET_MATCH_COLUMN_ID: ${{ secrets.TARGET_MATCH_COLUMN_ID }}
-        run: python main.py
+          # Routing is pinned in src/config.py (VERIFIED_ROUTES): Project List ->
+          # master schedule (all files) and Project List -> Project List - Blank Copy
+          # (PDFs only). No sheet or column IDs are passed here on purpose; the old
+          # SOURCE_*/TARGET_* secrets are not used.
+          SYNC_MODE: ${{ github.event_name == 'schedule' && 'apply' || inputs.mode || 'dry-run' }}
+        run: |
+          case "$SYNC_MODE" in
+            apply) python main.py --apply ;;
+            *) python main.py --dry-run ;;
+          esac
       - name: Cleanup
         if: always()
         run: |

@@ -19,6 +19,10 @@ on:
       - main
       - master
 
+# This workflow never uses GITHUB_TOKEN (it sends with RUNBOOK_DISPATCH_PAT); give it
+# no permissions.
+permissions: {}
+
 jobs:
   notify:
     # Only fire on the repo's default branch (works whether it's main or master)
